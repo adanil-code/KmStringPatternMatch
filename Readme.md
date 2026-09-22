@@ -246,43 +246,50 @@ To radically simplify verifying engine correctness, stepping through algorithmic
 
 ### Test Methodology & Benchmark Architecture
 
-Kernel-mode performance benchmarking demands strict control over system state to eliminate noise, scheduling interference, and measurement skew. 
+Kernel-mode performance benchmarking demands strict control over system state to eliminate noise, scheduling interference, and measurement skew. The test harness isolates execution and measures true physical ingestion performance using the following architectural principles:
 
-* **Correctness-First Execution Gating:** Performance metrics are completely meaningless if string evaluations fail to maintain 100% logical accuracy. Before high-throughput performance tests run, the harness executes an exhaustive 104-case functional verification suite covering both `WCHAR` and `CHAR` engines. Performance loops aggressively assert truth matching (`bRet == bExpectMatch`) on *every single iteration*; if a logic failure occurs, the thread instantly aborts all running workers and fails the entire suite.
-* **Thread Scheduling & Measurement Control:** Benchmark threads are created via `PsCreateSystemThread`, pinned to real-time priority 15 (`KeSetPriorityThread`), and explicitly synchronized on a master start event (`YieldProcessor()`) to coordinate worker start times to reduce scheduling skew during measurement.
-* **Compiler Barrier Rigor:** In high-speed measurement loops, a strict hardware/compiler boundary (`COMPILER_BARRIER()`) prevents optimizing compilers from eliding the search operations as dead code. Timestamps are recorded directly using hardware performance counters (`KeQueryPerformanceCounter`).
+* **Correctness-First Execution Gating:** Performance metrics are completely meaningless if string evaluations fail to maintain 100% logical accuracy. Before high-throughput performance tests run, the harness executes an exhaustive 104-case functional verification suite covering both `WCHAR` and `CHAR` engines. Inside the tight performance measurement loops, the harness asserts logical match integrity (`bRet == bExpectMatch`) on *every single iteration*; if any unexpected logic mismatch occurs, the worker immediately sets a global failure flag, records the divergent state, and aborts the entire suite.
+* **Per-Thread Throughput Aggregation & OS Isolation:** To prevent OS thread creation latency, thread-pool scheduling delays, synchronization waits (`KeWaitForSingleObject`), and teardown context switches from polluting execution timings, elapsed time is measured directly inside each worker thread. High-resolution hardware performance counters (`KeQueryPerformanceCounter`) capture timestamps immediately before and after the evaluation loop. Each worker calculates its local operation rate independently (`localOps * liFreq / localTicks`), and the orchestrator aggregates these per-thread throughput rates into a global total (`llTotalOpsPerSec`).
+* **Physical Stream Ingestion Bandwidth:** Throughput metrics represent the actual volume of string data streamed into the matching engine per second:
+  $$\text{BytesPerOp} = \text{TargetTextLength} \times \text{sizeof(TChar)}$$
+  $$\text{Throughput (MB/s)} = \frac{\text{Ops/sec} \times \text{BytesPerOp}}{1{,}048{,}576}$$
+  This measures physical memory bus and cache consumption, avoiding synthetic data-multiplication models that artificially multiply processed bytes by the registered pattern count.
+* **Concurrency-Scaled Latency:** Latency per operation is calculated with high precision in picoseconds and properly scaled by the active worker thread count:
+  $$\text{Total Latency (ps)} = \frac{10^{12} \times \text{ThreadCount}}{\text{Ops/sec}}$$
+  This accurately reflects the real-world latency of an individual `Search()` evaluation under concurrent multi-threaded execution rather than global completion intervals.
+* **Compiler Barrier Rigor:** Inside the inner measurement loop, a hardware compiler barrier (`COMPILER_BARRIER()`, mapping to `_ReadWriteBarrier()`) enforces strict memory boundaries, preventing optimizing compilers from eliding repeated `Search()` calls or hoisting code outside the timed loop.
 
 ### Performance Results
 
-*(Note: All metrics represent `MatchFirst` engine mode for optimal early-exit resolution. `CHAR` arrays process 8 characters per SWAR cycle compared to 4 for `WCHAR`, resulting in roughly double the baseline throughput in many evaluation paths.)*
+*(Note: All metrics represent `MatchFirst` engine mode for optimal early-exit resolution. `CHAR` arrays process 8 characters per SWAR cycle compared to 4 for `WCHAR`, yielding higher operation rates in raw literal evaluation paths.)*
 
 #### Bare-Metal Windows 11 (Intel Core i7-1165G7)
 *Environment: Windows 11 25H2, Bare-metal execution on physical Intel Core i7-1165G7. High-priority thread execution.*
 
-| Workload Profile | Pattern Count | Target Text Length | String Type | Operations/sec | Latency/Op |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **8.1 Million** | **123 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **6.2 Million** | **161 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **13.3 Million** | **75 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **8.6 Million** | **116 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **1,753** | **570.5 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **1,194** | **837.5 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **11.6 K** | **85.9 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **7.0 K** | **143.8 µs** |
+| Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **567 MB/s** | **10.6 Million** | **94 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **732 MB/s** | **6.9 Million** | **146 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **1,741 MB/s** | **14.3 Million** | **70 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,268 MB/s** | **9.3 Million** | **108 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **18 MB/s** | **1,883** | **531.1 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **26 MB/s** | **1,341** | **745.7 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,293 MB/s** | **13.2 K** | **75.5 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,416 MB/s** | **7.3 K** | **137.9 µs** |
 
 #### Virtualized Guest (VMware on Intel Core i7-8086K)
 *Environment: Windows 11 Virtual Machine (VMware Workstation) hosted on Intel Core i7-8086K. High-priority thread execution.*
 
-| Workload Profile | Pattern Count | Target Text Length | String Type | Operations/sec | Latency/Op |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **10.1 Million** | **99 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **7.0 Million** | **143 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **14.9 Million** | **67 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **8.6 Million** | **117 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **1,443** | **693.0 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **912** | **1096.5 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **10.9 K** | **91.4 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **6.2 K** | **160.7 µs** |
+| Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **537 MB/s** | **10.1 Million** | **99 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **669 MB/s** | **6.3 Million** | **160 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **1,556 MB/s** | **12.7 Million** | **78 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,428 MB/s** | **9.9 Million** | **101 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **15 MB/s** | **1,590** | **628.9 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **19 MB/s** | **1,004** | **996.0 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,281 MB/s** | **13.1 K** | **76.2 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,279 MB/s** | **6.5 K** | **152.7 µs** |
 
 > **Pattern Scaling Performance** — comparison between `CHAR` and `WCHAR` engines evaluating realistic file path patterns (e.g. `\\Device\\HarddiskVolume2\\Program Files\\App%u\\*\\crypt.exe`) across 10, 100, 1,000 and 10,000 pattern sets in MatchFirst mode.
 
@@ -299,7 +306,7 @@ Kernel-mode performance benchmarking demands strict control over system state to
   </tr>
 </table>
 
-Evaluating realistic paths requires an initial prefix hash lookup followed by a wildcard state machine. Scaling to 10,000 patterns expands the pattern metadata footprint. The mobile i7-1165G7 experiences mild cache pressure here, shifting `CHAR` throughput from 10.9M down to 7.4M operations per second. The desktop i7-8086K utilizes a more robust memory subsystem to absorb these scattered fetches without degradation. Despite minor cache effects on the mobile chip, the engine maintains nearly constant throughput overall, with `WCHAR` performance holding reliably between 6.0M and 7.0M operations per second across both systems.
+Evaluating realistic paths requires an initial prefix hash lookup followed by a wildcard state machine. Scaling to 10,000 patterns expands the pattern metadata footprint. Across both bare-metal and virtualized environments, the engine demonstrates sustained scaling: `CHAR` throughput holds between 10.0M and 11.6M operations per second, while `WCHAR` throughput reliably maintains between 6.3M and 7.3M operations per second from 10 to 10,000 registered rules.
 
 > **Exact String Scaling Performance** — comparison between `CHAR` and `WCHAR` engines evaluating 128-char exact literal patterns across 10, 100, 1,000 and 10,000 pattern sets in MatchFirst mode.
 
@@ -316,7 +323,7 @@ Evaluating realistic paths requires an initial prefix hash lookup followed by a 
   </tr>
 </table>
 
-For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 512-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both the mobile and desktop architectures to sustain their maximum baseline throughput without meaningful degradation from 10 to 10,000 registered patterns.
+For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 512-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both mobile and desktop architectures to sustain flat baseline performance (exceeding 9.3M ops/sec for `WCHAR` and up to 14.7M ops/sec for `CHAR`) without degradation from 10 to 10,000 registered patterns.
 
 > **See Also:** For details on the isolated performance behavior of the underlying data structures, refer to the `/TestContainer/` description in the [Project Layout](#project-layout).
 ---

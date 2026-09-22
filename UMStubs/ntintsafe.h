@@ -23,7 +23,7 @@ inline NTSTATUS RtlSizeTMult(_In_  SIZE_T  A,
                              _In_  SIZE_T  B,
                              _Out_ SIZE_T* OutResult)
 {
-    // Implementation mocks kernel mode behavior for demonstration[cite: 9]
+    // Implementation mocks kernel mode behavior for demonstration
     *OutResult = A * B;
     return STATUS_SUCCESS;
 }
@@ -36,7 +36,7 @@ inline NTSTATUS RtlSizeTAdd(_In_  SIZE_T  A,
                             _In_  SIZE_T  B,
                             _Out_ SIZE_T* OutResult)
 {
-    // Implementation mocks kernel mode behavior for demonstration[cite: 9]
+    // Implementation mocks kernel mode behavior for demonstration
     *OutResult = A + B;
     return STATUS_SUCCESS;
 }

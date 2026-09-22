@@ -528,16 +528,16 @@ VOID RunAllCorrectnessTests()
 template <typename TChar>
 struct PerfWorkerCtx
 {
-    KmStringPatternMatch<PatternContext, TChar>* pSpm;           // Pointer to the active string pattern matcher instance
-    const TChar*                                 pText;          // Pointer to the target text buffer to search
-    size_t                                       cchTextLen;     // Length of the text buffer in characters
-    volatile LONG64                              llTotalOps;     // Accumulated count of completed search operations
-    volatile LONG64                              llTotalTicks;   // Accumulated CPU ticks spent executing searches
-    volatile LONG                                lStartFlag;     // Flag indicating the worker has formally started
-    BOOLEAN                                      bUseMatchFirst; // Toggles between MatchFirst and MatchAll modes
-    BOOLEAN                                      bExpectMatch;   // Indicates whether a match is logically expected
-    volatile LONG                                lTestFailed;    // Flag set if a correctness logic violation occurs
-    volatile LONG                                lActualResult;  // Captures the erroneous boolean result on failure
+    KmStringPatternMatch<PatternContext, TChar>* pSpm;             // Pointer to the active string pattern matcher instance
+    const TChar*                                 pText;            // Pointer to the target text buffer to search
+    size_t                                       cchTextLen;       // Length of the text buffer in characters
+    volatile LONG64                              llTotalOpsPerSec; // Pre-aggregated rate of operations across all threads
+    LARGE_INTEGER                                liFreq;           // High-resolution clock frequency provided by orchestrator
+    volatile LONG                                lStartFlag;       // Flag indicating the worker has formally started
+    BOOLEAN                                      bUseMatchFirst;   // Toggles between MatchFirst and MatchAll modes
+    BOOLEAN                                      bExpectMatch;     // Indicates whether a match is logically expected
+    volatile LONG                                lTestFailed;      // Flag set if a correctness logic violation occurs
+    volatile LONG                                lActualResult;    // Captures the erroneous boolean result on failure
 };
 
 // -------------------------------------------------------------------------------------
@@ -569,6 +569,7 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
 
     if (!bAborted) [[likely]]
     {
+        // 1. Capture exact start time immediately before the work loop
         LARGE_INTEGER liStart = KeQueryPerformanceCounter(NULL);
 
         if (pWorkerCtx->bUseMatchFirst)
@@ -615,10 +616,17 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
             }
         }
 
+        // 2. Capture exact end time immediately after the stop flag is detected
         LARGE_INTEGER liEnd = KeQueryPerformanceCounter(NULL);
 
-        InterlockedExchangeAdd64(&pWorkerCtx->llTotalOps, localOps);
-        InterlockedExchangeAdd64(&pWorkerCtx->llTotalTicks, liEnd.QuadPart - liStart.QuadPart);
+        // 3. Calculate this thread's exact ops/sec, completely excluding OS teardown overhead
+        UINT64 localTicks = liEnd.QuadPart - liStart.QuadPart;
+        
+        if (localTicks > 0 && localOps > 0)
+        {
+            UINT64 localOpsPerSec = (localOps * pWorkerCtx->liFreq.QuadPart) / localTicks;
+            InterlockedExchangeAdd64(&pWorkerCtx->llTotalOpsPerSec, (LONG64)localOpsPerSec);
+        }
     }
 
     PsTerminateSystemThread(STATUS_SUCCESS);
@@ -756,6 +764,8 @@ BOOLEAN RunPerformanceTier(_In_ ULONG       ulPatternCount,
         Ctx.pSpm = &Spm;
         Ctx.pText = pwsText;
         Ctx.cchTextLen = ulTextLenChars;
+        Ctx.liFreq = liFreq;
+        Ctx.llTotalOpsPerSec = 0;
         Ctx.bUseMatchFirst = bMatchFirst;
         Ctx.bExpectMatch = bExpectMatch;
         Ctx.lTestFailed = 0;
@@ -771,7 +781,9 @@ BOOLEAN RunPerformanceTier(_In_ ULONG       ulPatternCount,
             KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
 
             InterlockedExchange(&Ctx.lStartFlag, 1);
-            StopAndWaitThreads(pMgr, 2);
+            
+            // Wait for threads to clean up (time taken here no longer corrupts the math)
+            StopAndWaitThreads(pMgr, 2);            
 
             if (Ctx.lTestFailed) [[unlikely]]
             {
@@ -783,27 +795,29 @@ BOOLEAN RunPerformanceTier(_In_ ULONG       ulPatternCount,
             }
             else
             {
-                UINT64 ullTicks = Ctx.llTotalTicks / (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1);
-
-                if (ullTicks == 0) [[unlikely]]
-                {
-                    ullTicks = 1;
-                }
-
-                UINT64 ullOps = Ctx.llTotalOps ? Ctx.llTotalOps : 1;
-
-                // Optimized math sequence to prevent 64-bit integer overflow during multi-gigabit throughput calculations
-                UINT64 opsPerSec = (ullOps * liFreq.QuadPart) / ullTicks;
-                UINT64 bytesPerOp = static_cast<UINT64>(ulTextLenChars) * sizeof(TChar) * ulPatternCount;
+                // Retrieve the purely isolated ops/sec from the threads
+                UINT64 opsPerSec = static_cast<UINT64>(Ctx.llTotalOpsPerSec);
+                
+                // Calculate Physical Stream Ingestion Bandwidth
+                UINT64 bytesPerOp = static_cast<UINT64>(ulTextLenChars) * sizeof(TChar);
                 UINT64 bytesPerSec = opsPerSec * bytesPerOp;
                 UINT64 mbWhole = bytesPerSec / (1024ULL * 1024ULL);
 
-                // High precision latency calculation to prevent 0.00us on fast systems
-                UINT64 totalPs = opsPerSec > 0 ? (1000000000000ULL / opsPerSec) : 0;
+                // High precision latency calculation factoring in true thread parallelism
+                UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
                 UINT64 usWhole = totalPs / 1000000;
                 UINT64 usFrac = (totalPs % 1000000) / 100;
 
-                LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                // Format with two decimal fraction places if throughput is below 1 MB/s
+                if (mbWhole < 1)
+                {
+                    UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
+                    LOG_INFO("[SPM_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
+                }
+                else
+                {
+                    LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                }
 
                 ExFreePoolWithTag(pMgr, DRIVER_TAG);
                 return TRUE;
@@ -954,6 +968,8 @@ BOOLEAN RunRealisticPathPerformanceTier(_In_ ULONG       ulPatternCount,
         Ctx.pSpm = &Spm;
         Ctx.pText = pwszTargetPath;
         Ctx.cchTextLen = cchPathLen;
+        Ctx.liFreq = liFreq;
+        Ctx.llTotalOpsPerSec = 0;
         Ctx.bUseMatchFirst = bMatchFirst;
         Ctx.bExpectMatch = bExpectMatch;
         Ctx.lTestFailed = 0;
@@ -969,6 +985,8 @@ BOOLEAN RunRealisticPathPerformanceTier(_In_ ULONG       ulPatternCount,
             KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
 
             InterlockedExchange(&Ctx.lStartFlag, 1);
+            
+            // Wait for threads to clean up (time taken here no longer corrupts the math)
             StopAndWaitThreads(pMgr, 2);            
 
             if (Ctx.lTestFailed) [[unlikely]]
@@ -981,25 +999,29 @@ BOOLEAN RunRealisticPathPerformanceTier(_In_ ULONG       ulPatternCount,
             }
             else
             {
-                UINT64 ullTicks = Ctx.llTotalTicks / (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1);
-
-                if (ullTicks == 0) [[unlikely]]
-                {
-                    ullTicks = 1;
-                }
-
-                UINT64 ullOps = Ctx.llTotalOps ? Ctx.llTotalOps : 1;
-
-                UINT64 opsPerSec = (ullOps * liFreq.QuadPart) / ullTicks;
-                UINT64 bytesPerOp = static_cast<UINT64>(cchPathLen) * sizeof(TChar) * ulPatternCount;
+                // Retrieve the purely isolated ops/sec from the threads
+                UINT64 opsPerSec = static_cast<UINT64>(Ctx.llTotalOpsPerSec);
+                
+                // Calculate Physical Stream Ingestion Bandwidth
+                UINT64 bytesPerOp = static_cast<UINT64>(cchPathLen) * sizeof(TChar);
                 UINT64 bytesPerSec = opsPerSec * bytesPerOp;
                 UINT64 mbWhole = bytesPerSec / (1024ULL * 1024ULL);
 
-                UINT64 totalPs = opsPerSec > 0 ? (1000000000000ULL / opsPerSec) : 0;
+                // High precision latency calculation factoring in true thread parallelism
+                UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
                 UINT64 usWhole = totalPs / 1000000;
                 UINT64 usFrac = (totalPs % 1000000) / 100;
 
-                LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                // Format with two decimal fraction places if throughput is below 1 MB/s
+                if (mbWhole < 1)
+                {
+                    UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
+                    LOG_INFO("[SPM_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
+                }
+                else
+                {
+                    LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                }
 
                 ExFreePoolWithTag(pMgr, DRIVER_TAG);
                 return TRUE;
@@ -1150,6 +1172,8 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
         Ctx.pSpm = &Spm;
         Ctx.pText = pwsText;
         Ctx.cchTextLen = ulTextLenChars;
+        Ctx.liFreq = liFreq;
+        Ctx.llTotalOpsPerSec = 0;
         Ctx.bUseMatchFirst = bMatchFirst;
         Ctx.bExpectMatch = bExpectMatch;
         Ctx.lTestFailed = 0;
@@ -1165,6 +1189,8 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
             KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
 
             InterlockedExchange(&Ctx.lStartFlag, 1);
+            
+            // Wait for threads to clean up (time taken here no longer corrupts the math)
             StopAndWaitThreads(pMgr, 2);            
 
             if (Ctx.lTestFailed) [[unlikely]]
@@ -1177,25 +1203,29 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
             }
             else
             {
-                UINT64 ullTicks = Ctx.llTotalTicks / (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1);
-
-                if (ullTicks == 0) [[unlikely]]
-                {
-                    ullTicks = 1;
-                }
-
-                UINT64 ullOps = Ctx.llTotalOps ? Ctx.llTotalOps : 1;
-
-                UINT64 opsPerSec = (ullOps * liFreq.QuadPart) / ullTicks;
-                UINT64 bytesPerOp = static_cast<UINT64>(ulTextLenChars) * sizeof(TChar) * ulPatternCount;
+                // Retrieve the purely isolated ops/sec from the threads
+                UINT64 opsPerSec = static_cast<UINT64>(Ctx.llTotalOpsPerSec);
+                
+                // Calculate Physical Stream Ingestion Bandwidth
+                UINT64 bytesPerOp = static_cast<UINT64>(ulTextLenChars) * sizeof(TChar);
                 UINT64 bytesPerSec = opsPerSec * bytesPerOp;
                 UINT64 mbWhole = bytesPerSec / (1024ULL * 1024ULL);
 
-                UINT64 totalPs = opsPerSec > 0 ? (1000000000000ULL / opsPerSec) : 0;
+                // High precision latency calculation factoring in true thread parallelism
+                UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
                 UINT64 usWhole = totalPs / 1000000;
                 UINT64 usFrac = (totalPs % 1000000) / 100;
 
-                LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                // Format with two decimal fraction places if throughput is below 1 MB/s
+                if (mbWhole < 1)
+                {
+                    UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
+                    LOG_INFO("[SPM_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
+                }
+                else
+                {
+                    LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                }
 
                 ExFreePoolWithTag(pMgr, DRIVER_TAG);
                 return TRUE;
@@ -1312,6 +1342,8 @@ BOOLEAN RunExactStringPerformanceTier(_In_ ULONG       ulPatternCount,
         Ctx.pSpm = &Spm;
         Ctx.pText = pwsText;
         Ctx.cchTextLen = ulTextLenChars;
+        Ctx.liFreq = liFreq;
+        Ctx.llTotalOpsPerSec = 0;
         Ctx.bUseMatchFirst = bMatchFirst;
         Ctx.bExpectMatch = bExpectMatch;
         Ctx.lTestFailed = 0;
@@ -1327,6 +1359,8 @@ BOOLEAN RunExactStringPerformanceTier(_In_ ULONG       ulPatternCount,
             KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
 
             InterlockedExchange(&Ctx.lStartFlag, 1);
+            
+            // Wait for threads to clean up (time taken here no longer corrupts the math)
             StopAndWaitThreads(pMgr, 2);            
 
             if (Ctx.lTestFailed) [[unlikely]]
@@ -1339,25 +1373,29 @@ BOOLEAN RunExactStringPerformanceTier(_In_ ULONG       ulPatternCount,
             }
             else
             {
-                UINT64 ullTicks = Ctx.llTotalTicks / (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1);
-
-                if (ullTicks == 0) [[unlikely]]
-                {
-                    ullTicks = 1;
-                }
-
-                UINT64 ullOps = Ctx.llTotalOps ? Ctx.llTotalOps : 1;
-
-                UINT64 opsPerSec = (ullOps * liFreq.QuadPart) / ullTicks;
-                UINT64 bytesPerOp = static_cast<UINT64>(ulTextLenChars) * sizeof(TChar) * ulPatternCount;
+                // Retrieve the purely isolated ops/sec from the threads
+                UINT64 opsPerSec = static_cast<UINT64>(Ctx.llTotalOpsPerSec);
+                
+                // Calculate Physical Stream Ingestion Bandwidth
+                UINT64 bytesPerOp = static_cast<UINT64>(ulTextLenChars) * sizeof(TChar);
                 UINT64 bytesPerSec = opsPerSec * bytesPerOp;
                 UINT64 mbWhole = bytesPerSec / (1024ULL * 1024ULL);
 
-                UINT64 totalPs = opsPerSec > 0 ? (1000000000000ULL / opsPerSec) : 0;
+                // High precision latency calculation factoring in true thread parallelism
+                UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
                 UINT64 usWhole = totalPs / 1000000;
                 UINT64 usFrac = (totalPs % 1000000) / 100;
 
-                LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                // Format with two decimal fraction places if throughput is below 1 MB/s
+                if (mbWhole < 1)
+                {
+                    UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
+                    LOG_INFO("[SPM_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
+                }
+                else
+                {
+                    LOG_INFO("[SPM_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                }
 
                 ExFreePoolWithTag(pMgr, DRIVER_TAG);
                 return TRUE;
