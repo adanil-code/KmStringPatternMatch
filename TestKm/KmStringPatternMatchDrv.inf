@@ -1,0 +1,54 @@
+; KmStringPatternMatchDrv.inf
+; INF file for substring search test kernel-mode driver
+
+[Version]
+Signature           = "$WINDOWS NT$"
+Class               = System
+ClassGuid           = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider            = %ManufacturerName%
+DriverVer           = 03/11/2026,1.0.0.0
+CatalogFile         = KmStringPatternMatchDrv.cat
+PnpLockdown         = 1
+
+[DestinationDirs]
+KmStringPatternMatchDrv_CopyFiles  = 12 ; %SystemRoot%\System32\drivers
+
+[SourceDisksNames]
+1                       = %DiskName%,,,
+
+[SourceDisksFiles]
+KmStringPatternMatchDrv.sys        = 1
+
+[Manufacturer]
+%ManufacturerName%  = KmStringPatternMatchDrv_Manufacturer, NTx86, NTamd64, NTarm64
+
+[KmStringPatternMatchDrv_Manufacturer.NTx86]
+%KmStringPatternMatchDrv_DeviceDesc% = KmStringPatternMatchDrv_Install, Root\KmStringPatternMatchDrv
+
+[KmStringPatternMatchDrv_Manufacturer.NTamd64]
+%KmStringPatternMatchDrv_DeviceDesc% = KmStringPatternMatchDrv_Install, Root\KmStringPatternMatchDrv
+
+[KmStringPatternMatchDrv_Manufacturer.NTarm64]
+%KmStringPatternMatchDrv_DeviceDesc% = KmStringPatternMatchDrv_Install, Root\KmStringPatternMatchDrv
+
+[KmStringPatternMatchDrv_Install]
+CopyFiles           = KmStringPatternMatchDrv_CopyFiles
+
+[KmStringPatternMatchDrv_Install.Services]
+AddService          = KmStringPatternMatchDrv, 0x00000002, KmStringPatternMatchDrv_Service_Install
+
+[KmStringPatternMatchDrv_CopyFiles]
+KmStringPatternMatchDrv.sys
+
+[KmStringPatternMatchDrv_Service_Install]
+DisplayName         = %KmStringPatternMatchDrv_ServiceName%
+ServiceType         = 1 ; SERVICE_KERNEL_DRIVER
+StartType           = 3 ; SERVICE_DEMAND_START
+ErrorControl        = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary       = %12%\KmStringPatternMatchDrv.sys
+
+[Strings]
+ManufacturerName                    = "AD"
+KmStringPatternMatchDrv_DeviceDesc  = "Pattern search test Driver"
+KmStringPatternMatchDrv_ServiceName = "KmStringPatternMatchDrv"
+DiskName                            = "Pattern search test Driver Installation Disk"

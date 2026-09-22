@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="ContainerTests.vcxproj" Id="ea2a1e2b-92b7-4977-9907-d24e419642b8" />
+</Solution>

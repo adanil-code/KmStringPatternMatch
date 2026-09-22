@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="KmStringPatternMatchUm.vcxproj" Id="bb77842c-9bc5-443d-bb28-7af5c87cfc8e" />
+</Solution>
