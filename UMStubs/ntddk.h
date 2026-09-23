@@ -43,6 +43,9 @@ typedef uint64_t POOL_FLAGS;
 #ifndef STATUS_QUOTA_EXCEEDED
 #define STATUS_QUOTA_EXCEEDED         0xC0000044
 #endif
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL       0xC0000023
+#endif
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status)            (((NTSTATUS)(Status)) >= 0)
 #endif
@@ -51,6 +54,10 @@ typedef uint64_t POOL_FLAGS;
 #define POOL_FLAG_CACHE_ALIGNED       0x0000000400000000ull
 #define POOL_FLAG_PAGED               0x0000000800000000ull
 #define POOL_FLAG_NON_PAGED           0x0000020000000000ull
+
+#ifndef ALL_PROCESSOR_GROUPS
+#define ALL_PROCESSOR_GROUPS          0xFFFF
+#endif
 
 // -------------------------------------------------------------------------------------
 // Environment & IRQL Mocks
@@ -374,6 +381,46 @@ inline LARGE_INTEGER KeQueryPerformanceCounter(_Out_opt_ PLARGE_INTEGER Performa
 
     QueryPerformanceCounter(&count);
     return count;
+}
+
+//--------------------------------------------------------------------------------
+// Retrieves information about the relationships of one or more logical processors.
+//--------------------------------------------------------------------------------
+inline NTSTATUS KeQueryLogicalProcessorRelationship(_In_opt_ PPROCESSOR_NUMBER                                             ProcessorNumber,
+                                                  _In_     LOGICAL_PROCESSOR_RELATIONSHIP                                  RelationshipType,
+                                                  _Out_writes_bytes_opt_(*Length) PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX Information,
+                                                  _Inout_  PULONG                                                          Length)
+{
+    UNREFERENCED_PARAMETER(ProcessorNumber);
+    
+    if (GetLogicalProcessorInformationEx(RelationshipType, Information, (PDWORD)Length))
+    {
+        return STATUS_SUCCESS;
+    }
+    
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+    {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    
+    return STATUS_INSUFFICIENT_RESOURCES;
+}
+
+//--------------------------------------------------------------------------------
+// Sets the thread group affinity.
+//--------------------------------------------------------------------------------
+inline VOID KeSetSystemGroupAffinityThread(_In_      PGROUP_AFFINITY Affinity,
+                                           _Out_opt_ PGROUP_AFFINITY PreviousAffinity)
+{
+    SetThreadGroupAffinity(GetCurrentThread(), Affinity, PreviousAffinity);
+}
+
+//--------------------------------------------------------------------------------
+// Retrieves the number of active processors in a specified group.
+//--------------------------------------------------------------------------------
+inline ULONG KeQueryActiveProcessorCountEx(_In_ USHORT GroupNumber)
+{
+    return GetActiveProcessorCount(GroupNumber);
 }
 
 //--------------------------------------------------------------------------------

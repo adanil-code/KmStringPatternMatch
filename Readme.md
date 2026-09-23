@@ -47,12 +47,12 @@ To support precision file system filtering, the engine natively implements path 
 
 ### High-Level Design
 The engine uses a two-phase architecture: registration-time preprocessing and search-time candidate evaluation to maximize CPU efficiency:
-1. **Registration Phase:** When a pattern is added, the engine parses it into an exact *literal prefix* and a *wildcard suffix*. The literal prefix is case-folded (if configured), hashed, and mapped into a SwissTable-style hash map, while the user's context payload is stored in a segmented deque. The hash is then stamped into a 512-bit hash-existence filter. Note: `AddPattern()` and `Clear()` mutate the internal structures, while `Search()` reads them; callers must ensure proper external synchronization if modifying the engine concurrently.
-2. **Search Phase:** As target text arrives, the engine calculates an incremental block hash. It checks the hash-existence filter first. If the corresponding bit is set, it probes the hash map to retrieve potential pattern candidates. For any candidates found, it performs an exact SWAR comparison on the literal prefix. If the prefix matches, it hands the remaining unparsed text over to the non-recursive wildcard state machine. If the wildcards match, the saved context payload is returned.
+1. **Registration Phase:** When a pattern is added, the engine parses it into an exact *literal prefix* and a *wildcard suffix*. The literal prefix is case-folded (if configured), hashed, and mapped into a SwissTable-style hash map, while the user's context payload is stored in a segmented deque. The pattern's trailing literal segment (tail anchor) and minimum required match length are precalculated and cached. The prefix hash is then stamped into a 512-bit hash-existence filter. Note: `AddPattern()` and `Clear()` mutate the internal structures, while `Search()` reads them; callers must ensure proper external synchronization if modifying the engine concurrently.
+2. **Search Phase:** As target text arrives, the engine performs a global minimum length bounds check, followed by an incremental block hash. It checks the hash-existence filter first. If the corresponding bit is set, it probes the hash map to retrieve potential pattern candidates. For each candidate, it verifies the minimum match length, checks the anchored literal tail, and performs an exact SWAR comparison on the literal prefix. If the prefix matches, it hands the remaining unparsed text over to the non-recursive wildcard state machine. If the wildcards match, the saved context payload is returned.
 
 ### 1. Custom WDK Container Ecosystem
 Since the Windows Driver Kit (WDK) lacks appropriate C++ containers (such as `std::unordered_map` or `std::vector`), the engine relies entirely on a custom-built, kernel-safe container ecosystem optimized for minimal overhead:
-* **`KStringArena`:** Carves character blocks from continuous backbuffer memory slabs. String lifespans are permanently locked to the arena, reducing per-string allocation overhead, alignment waste, and fragmentation associated with allocating individual strings.
+* **`KStringArena`:** Carves character blocks from continuous backbuffer memory slabs. String lifespans are permanently locked to the arena, reducing per-string allocation overhead, alignment waste, and fragmentation associated with allocating individual strings. Supports lightweight bookmarks for atomic multi-allocation rollbacks on registration failures.
 * **`KFlatHashMap`:** An open-addressing hash table modeled after SwissTable architectures. It isolates an array of 1-byte metadata entries (`m_Ctrl`) from key-value pairs (`m_Slots`). Matching fetches 8 control bytes at once and utilizes bitwise SWAR operations to identify match indices.
 * **`KDeque`:** A segmented array-based double-ended queue. It circumvents massive contiguous dynamic allocations by segmenting data into fixed-size chunks, bounded to a maximum of 256 dynamically tracked blocks. This imposes the engine's 131,072 maximum element limit, intentionally preventing unbounded memory exhaustion.
 * **`KVector`:** A resizable contiguous array implementing Small Vector Optimization (SVO). It embeds a pre-sized inline byte buffer to handle collections of 2 or fewer elements locally, bypassing dynamic pool allocations for collections containing two or fewer elements.
@@ -65,10 +65,11 @@ To eliminate this overhead, the engine intentionally relies on a scalar, GPR-onl
 * The architecture-specific implementations use hardware intrinsics (`_umul128` on x64, `__umulh` on ARM64) to perform the 128-bit multiplication/mixing operations.
 * The resulting 64-bit hash feeds directly into a **512-bit hash-existence filter bitmap array** (`m_HashFilter`). This serves as a high-speed fast-path rejection mechanism, allowing the engine to discard incoming string targets that do not generate valid hashes for any registered pattern prefix.
 
-### 3. Overlapping 64-bit SWAR Literal Evaluation
-For literal pattern prefixes, the engine leverages SIMD Within A Register (SWAR) chunking rather than sequential character-by-character comparisons.
+### 3. Overlapping 64-bit SWAR Literal Evaluation & Anchored Tail Filtering
+For literal pattern prefixes and anchored suffixes, the engine leverages SIMD Within A Register (SWAR) chunking rather than sequential character-by-character comparisons:
 * The target text is loaded into 64-bit blocks using aliasing-safe unaligned loads.
-* **Case-Insensitive Fast Path:** To support case-insensitivity without heavy branching, the engine performs a high-speed SWAR ASCII check (`IsAsciiSWAR`). If the 64-bit block is entirely ASCII, it applies an inline bitwise arithmetic transformation (`ToUpperSWAR`) to case-fold all 8 characters efficiently.
+* **Case-Insensitive Fast Path:** To support case-insensitivity without heavy branching, the engine performs a high-speed SWAR ASCII check (`IsAsciiSWAR`). If the 64-bit block is entirely ASCII, it applies an inline bitwise arithmetic transformation (`ToUpperSWAR`) to case-fold all characters in parallel without scalar conversion loops.
+* **Anchored Tail Verification & Minimum Length Filtering:** To prune non-matching candidates before executing the state machine, the engine precomputes the trailing literal anchor and the required non-wildcard character count for each rule. Candidates are filtered out in $O(1)$ time if the target string length is below the minimum required length or if the tail literal segment fails SWAR comparison, dramatically accelerating negative mismatch paths.
 
 ### 4. Non-Recursive Fast-Forward Wildcard State Machine
 Traditional wildcard evaluators suffer from severe stack depth exhaustion and CPU pipeline stalling caused by deep recursive backtracking. 
@@ -249,6 +250,7 @@ To radically simplify verifying engine correctness, stepping through algorithmic
 Kernel-mode performance benchmarking demands strict control over system state to eliminate noise, scheduling interference, and measurement skew. The test harness isolates execution and measures true physical ingestion performance using the following architectural principles:
 
 * **Correctness-First Execution Gating:** Performance metrics are completely meaningless if string evaluations fail to maintain 100% logical accuracy. Before high-throughput performance tests run, the harness executes an exhaustive 104-case functional verification suite covering both `WCHAR` and `CHAR` engines. Inside the tight performance measurement loops, the harness asserts logical match integrity (`bRet == bExpectMatch`) on *every single iteration*; if any unexpected logic mismatch occurs, the worker immediately sets a global failure flag, records the divergent state, and aborts the entire suite.
+* **Processor Topology & P-Core Hyperthreading Affinity:** To eliminate thread preemption, core migration, and asymmetric scheduler throttling, the test suite dynamically enumerates the hardware processor topology via `KeQueryLogicalProcessorRelationship` (or `GetLogicalProcessorInformationEx` in user mode stub). It queries `RelationProcessorCore` to detect physical Performance cores (`maxEfficiencyClass`), intentionally excluding power-saving Efficiency cores (E-cores / LP-cores). It then unpacks all SMT / hyperthreading sibling threads belonging to each physical P-core. The harness pins worker threads 1:1 to these logical P-core threads using strict thread group affinity (`KeSetSystemGroupAffinityThread` / `SetThreadGroupAffinity`), elevating thread priority to time-critical levels (`THREAD_PRIORITY_TIME_CRITICAL` / priority 15).
 * **Per-Thread Throughput Aggregation & OS Isolation:** To prevent OS thread creation latency, thread-pool scheduling delays, synchronization waits (`KeWaitForSingleObject`), and teardown context switches from polluting execution timings, elapsed time is measured directly inside each worker thread. High-resolution hardware performance counters (`KeQueryPerformanceCounter`) capture timestamps immediately before and after the evaluation loop. Each worker calculates its local operation rate independently (`localOps * liFreq / localTicks`), and the orchestrator aggregates these per-thread throughput rates into a global total (`llTotalOpsPerSec`).
 * **Physical Stream Ingestion Bandwidth:** Throughput metrics represent the actual volume of string data streamed into the matching engine per second:
   $$\text{BytesPerOp} = \text{TargetTextLength} \times \text{sizeof(TChar)}$$
@@ -268,28 +270,28 @@ Kernel-mode performance benchmarking demands strict control over system state to
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **567 MB/s** | **10.6 Million** | **94 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **732 MB/s** | **6.9 Million** | **146 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **1,741 MB/s** | **14.3 Million** | **70 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,268 MB/s** | **9.3 Million** | **108 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **18 MB/s** | **1,883** | **531.1 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **26 MB/s** | **1,341** | **745.7 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,293 MB/s** | **13.2 K** | **75.5 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,416 MB/s** | **7.3 K** | **137.9 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **663 MB/s** | **12.4 Million** | **81 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **810 MB/s** | **7.6 Million** | **132 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **2,294 MB/s** | **18.8 Million** | **53 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,592 MB/s** | **10.6 Million** | **94 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **18 MB/s** | **1,879** | **532.2 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **25 MB/s** | **1,326** | **754.1 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,255 MB/s** | **12.9 K** | **77.8 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,358 MB/s** | **7.0 K** | **143.8 µs** |
 
 #### Virtualized Guest (VMware on Intel Core i7-8086K)
 *Environment: Windows 11 Virtual Machine (VMware Workstation) hosted on Intel Core i7-8086K. High-priority thread execution.*
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **537 MB/s** | **10.1 Million** | **99 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **669 MB/s** | **6.3 Million** | **160 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **1,556 MB/s** | **12.7 Million** | **78 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,428 MB/s** | **9.9 Million** | **101 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **15 MB/s** | **1,590** | **628.9 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **19 MB/s** | **1,004** | **996.0 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,281 MB/s** | **13.1 K** | **76.2 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,279 MB/s** | **6.5 K** | **152.7 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **590 MB/s** | **11.1 Million** | **90 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **793 MB/s** | **7.4 Million** | **135 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **2,070 MB/s** | **17.0 Million** | **59 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,597 MB/s** | **10.6 Million** | **94 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **13 MB/s** | **1,398** | **715.3 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **15 MB/s** | **816** | **1,225.5 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,082 MB/s** | **11.1 K** | **90.2 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,113 MB/s** | **5.7 K** | **175.3 µs** |
 
 > **Pattern Scaling Performance** — comparison between `CHAR` and `WCHAR` engines evaluating realistic file path patterns (e.g. `\\Device\\HarddiskVolume2\\Program Files\\App%u\\*\\crypt.exe`) across 10, 100, 1,000 and 10,000 pattern sets in MatchFirst mode.
 
@@ -306,7 +308,7 @@ Kernel-mode performance benchmarking demands strict control over system state to
   </tr>
 </table>
 
-Evaluating realistic paths requires an initial prefix hash lookup followed by a wildcard state machine. Scaling to 10,000 patterns expands the pattern metadata footprint. Across both bare-metal and virtualized environments, the engine demonstrates sustained scaling: `CHAR` throughput holds between 10.0M and 11.6M operations per second, while `WCHAR` throughput reliably maintains between 6.3M and 7.3M operations per second from 10 to 10,000 registered rules.
+Evaluating realistic paths requires an initial prefix hash lookup followed by a wildcard state machine. Scaling to 10,000 patterns expands the pattern metadata footprint. Across both bare-metal and virtualized environments, the engine demonstrates sustained scaling: `CHAR` throughput holds between 11.0M and 13.6M operations per second, while `WCHAR` throughput reliably maintains between 7.1M and 7.6M operations per second from 10 to 10,000 registered rules.
 
 > **Exact String Scaling Performance** — comparison between `CHAR` and `WCHAR` engines evaluating 128-char exact literal patterns across 10, 100, 1,000 and 10,000 pattern sets in MatchFirst mode.
 
@@ -323,7 +325,7 @@ Evaluating realistic paths requires an initial prefix hash lookup followed by a 
   </tr>
 </table>
 
-For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 512-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both mobile and desktop architectures to sustain flat baseline performance (exceeding 9.3M ops/sec for `WCHAR` and up to 14.7M ops/sec for `CHAR`) without degradation from 10 to 10,000 registered patterns.
+For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 512-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both mobile and desktop architectures to sustain flat baseline performance (exceeding 10.6M ops/sec for `WCHAR` and up to 18.8M ops/sec for `CHAR`) without degradation from 10 to 10,000 registered patterns.
 
 > **See Also:** For details on the isolated performance behavior of the underlying data structures, refer to the `/TestContainer/` description in the [Project Layout](#project-layout).
 ---

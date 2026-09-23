@@ -40,7 +40,7 @@ extern volatile LONG g_lAbortTests;
 
 VOID FlushLogToFile();
 
-#define MAX_TEST_THREADS 32
+#define MAX_TEST_THREADS 64
 
 // Configuration structure allowing callers to selectively run modules
 struct TEST_SUITE_CONFIG
@@ -52,10 +52,13 @@ struct TEST_SUITE_CONFIG
 // Context tracking state for individual test worker threads
 struct TEST_WORKER_CONTEXT
 {
-    ULONG          ulThreadId;   // Unique identifier assigned to the worker thread
-    PKEVENT        pStartEvent;  // Kernel event used to synchronize thread startup
-    volatile LONG* plStopFlag;   // Shared flag signaling all threads to safely terminate
-    PVOID          pUserContext; // Opaque pointer to user-defined test state data
+    ULONG          ulThreadId;    // Unique identifier assigned to the worker thread
+    PKEVENT        pStartEvent;   // Kernel event used to synchronize thread startup
+    volatile LONG* plStopFlag;    // Shared flag signaling all threads to safely terminate
+    PVOID          pUserContext;  // Opaque pointer to user-defined test state data
+    BOOLEAN        bSetAffinity;  // Flag to apply explicit thread affinity locking
+    USHORT         AffinityGroup; // Processor group assigned for thread affinity
+    KAFFINITY      AffinityMask;  // Logical processor mask assigned for thread affinity
 };
 
 typedef VOID (*PTEST_WORKER_FUNC)(_Inout_ TEST_WORKER_CONTEXT* pContext);
@@ -63,12 +66,114 @@ typedef VOID (*PTEST_WORKER_FUNC)(_Inout_ TEST_WORKER_CONTEXT* pContext);
 // Manager handling thread pooling and synchronization
 struct TEST_THREAD_MANAGER
 {
-    PETHREAD            pThreads[MAX_TEST_THREADS];     // Array of kernel thread object pointers
-    TEST_WORKER_CONTEXT Contexts[MAX_TEST_THREADS];     // Pre-allocated contexts for each worker
-    ULONG               ulThreadCount;                  // Total number of actively running threads
-    KEVENT              StartEvent;                     // Master event to unblock all workers simultaneously
-    volatile LONG       lStopFlag;                      // Master termination signal flag for the pool
+    PETHREAD            pThreads[MAX_TEST_THREADS]; // Array of kernel thread object pointers
+    TEST_WORKER_CONTEXT Contexts[MAX_TEST_THREADS]; // Pre-allocated contexts for each worker
+    ULONG               ulThreadCount;              // Total number of actively running threads
+    KEVENT              StartEvent;                 // Master event to unblock all workers simultaneously
+    volatile LONG       lStopFlag;                  // Master termination signal flag for the pool
 };
+
+// -------------------------------------------------------------------------------------
+// Processor Topology & Robust P-Core Detector (Excludes E-cores and LP-cores)
+// -------------------------------------------------------------------------------------
+struct PCORE_THREAD_INFO
+{
+    USHORT    Group;      // Processor group index
+    KAFFINITY ThreadMask; // Isolated 1-bit mask representing a distinct logical processor on a P-core
+};
+
+inline KVector<PCORE_THREAD_INFO, POOL_FLAG_PAGED> GetPCoreLogicalThreads()
+{
+    KVector<PCORE_THREAD_INFO, POOL_FLAG_PAGED> pCoreThreads;
+    ULONG length = 0;
+
+    NTSTATUS status = KeQueryLogicalProcessorRelationship(NULL, RelationProcessorCore, NULL, &length);
+    if (status != STATUS_BUFFER_TOO_SMALL && length == 0)
+    {
+        return pCoreThreads;
+    }
+
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)ExAllocatePool2(POOL_FLAG_PAGED, length, DRIVER_TAG);
+    if (!buffer)
+    {
+        return pCoreThreads;
+    }
+
+    status = KeQueryLogicalProcessorRelationship(NULL, RelationProcessorCore, buffer, &length);
+    if (!NT_SUCCESS(status))
+    {
+        ExFreePoolWithTag(buffer, DRIVER_TAG);
+        return pCoreThreads;
+    }
+
+    UCHAR maxEfficiencyClass = 0;
+    BOOLEAN foundCore = FALSE;
+
+    ULONG offset = 0;
+    while (offset < length)
+    {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((PUCHAR)buffer + offset);
+        if (info->Relationship == RelationProcessorCore)
+        {
+            foundCore = TRUE;
+            if (info->Processor.EfficiencyClass > maxEfficiencyClass)
+            {
+                maxEfficiencyClass = info->Processor.EfficiencyClass;
+            }
+        }
+        if (info->Size == 0)
+        {
+            break;
+        }
+        offset += info->Size;
+    }
+
+    if (!foundCore)
+    {
+        ExFreePoolWithTag(buffer, DRIVER_TAG);
+        return pCoreThreads;
+    }
+
+    offset = 0;
+    while (offset < length)
+    {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((PUCHAR)buffer + offset);
+        if (info->Relationship == RelationProcessorCore && info->Processor.EfficiencyClass == maxEfficiencyClass)
+        {
+            for (USHORT g = 0; g < info->Processor.GroupCount; ++g)
+            {
+                KAFFINITY coreMask = info->Processor.GroupMask[g].Mask;
+                USHORT group = info->Processor.GroupMask[g].Group;
+
+                // Unpack each logical SMT/HT thread bit belonging to this physical P-core
+                while (coreMask != 0)
+                {
+                    KAFFINITY singleThreadMask = coreMask & (~coreMask + 1);
+                    coreMask &= ~singleThreadMask;
+
+                    PCORE_THREAD_INFO threadInfo;
+                    threadInfo.Group = group;
+                    threadInfo.ThreadMask = singleThreadMask;
+                    pCoreThreads.PushBack(threadInfo);
+                }
+            }
+        }
+        if (info->Size == 0)
+        {
+            break;
+        }
+        offset += info->Size;
+    }
+
+    ExFreePoolWithTag(buffer, DRIVER_TAG);
+    return pCoreThreads;
+}
+
+// Alias for backwards compatibility
+inline KVector<PCORE_THREAD_INFO, POOL_FLAG_PAGED> GetPhysicalPCores()
+{
+    return GetPCoreLogicalThreads();
+}
 
 // -------------------------------------------------------------------------------------
 // String Length Helpers abstracting char/WCHAR native operations
@@ -85,6 +190,8 @@ inline size_t KStringLength(_In_z_ const wchar_t* __restrict s)
 // -------------------------------------------------------------------------------------
 // Initializes and starts a pool of worker threads synchronized on an event.
 // Used to saturate the CPU and memory bus during high-throughput performance testing.
+// Automatically pins threads to logical P-core threads to eliminate preemption and 
+// throttling.
 // -------------------------------------------------------------------------------------
 VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
                   _In_     ULONG                ulCount,
@@ -92,6 +199,24 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
                   _In_opt_ PVOID                pUserContext)
 {
     PAGED_CODE();
+
+    KVector<PCORE_THREAD_INFO, POOL_FLAG_PAGED> pCoreThreads = GetPCoreLogicalThreads();
+
+    if (pCoreThreads.Size() > 0)
+    {
+        if (ulCount > pCoreThreads.Size())
+        {
+            ulCount = static_cast<ULONG>(pCoreThreads.Size());
+        }
+    }
+    else
+    {
+        ULONG activeProcs = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        if (activeProcs > 0 && ulCount > activeProcs)
+        {
+            ulCount = activeProcs;
+        }
+    }
 
     if (ulCount > MAX_TEST_THREADS) [[unlikely]]
     {
@@ -109,6 +234,19 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
         pMgr->Contexts[ulIndex].pStartEvent = &pMgr->StartEvent;
         pMgr->Contexts[ulIndex].plStopFlag = &pMgr->lStopFlag;
         pMgr->Contexts[ulIndex].pUserContext = pUserContext;
+
+        if (pCoreThreads.Size() > 0 && ulIndex < pCoreThreads.Size())
+        {
+            pMgr->Contexts[ulIndex].bSetAffinity = TRUE;
+            pMgr->Contexts[ulIndex].AffinityGroup = pCoreThreads[ulIndex].Group;
+            pMgr->Contexts[ulIndex].AffinityMask = pCoreThreads[ulIndex].ThreadMask;
+        }
+        else
+        {
+            pMgr->Contexts[ulIndex].bSetAffinity = FALSE;
+            pMgr->Contexts[ulIndex].AffinityGroup = 0;
+            pMgr->Contexts[ulIndex].AffinityMask = 0;
+        }
 
         HANDLE hThread;
         NTSTATUS ntStatus = PsCreateSystemThread(&hThread,
@@ -544,11 +682,20 @@ struct PerfWorkerCtx
 // Iteratively runs search operations in a tight loop to calculate throughput.
 // Branches loop internally to prevent branch prediction overhead during measurement.
 // Terminates loop and safely notifies orchestrator if an unexpected match logic failure occurs.
+// Applies thread affinity directly to the kernel thread scope if executing natively.
 // -------------------------------------------------------------------------------------
 template <typename TChar>
 VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
 {
     PAGED_CODE();
+
+    if (pCtx->bSetAffinity)
+    {
+        GROUP_AFFINITY affinity = {0};
+        affinity.Group = pCtx->AffinityGroup;
+        affinity.Mask = pCtx->AffinityMask;
+        KeSetSystemGroupAffinityThread(&affinity, NULL);
+    }
 
     PerfWorkerCtx<TChar>* pWorkerCtx = (PerfWorkerCtx<TChar>*)pCtx->pUserContext;
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
