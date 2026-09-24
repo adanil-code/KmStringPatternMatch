@@ -230,9 +230,8 @@ enum WILD_CARD_SCOPE : UINT8
 
 namespace KmStringPatternMatchDetail
 {
-// -------------------------------------------------------------------------------------------
-    // Cross-Platform 64x64 -> 128-bit Scalar Mixer
-    // Breaks execution dependency chains while providing bit good avalanche.
+    // -------------------------------------------------------------------------------------------    
+    // Breaks execution dependency chains while providing bit avalanche.
     //
     // Parameters:
     //   State - The 64-bit integer state to mix with the internal prime constant.
