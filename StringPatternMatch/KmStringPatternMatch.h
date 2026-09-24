@@ -722,7 +722,7 @@ KmStringPatternMatch<TContext, TChar, PoolType>::KmStringPatternMatch(_In_ bool 
 // Registers a pattern, parsing out literal prefixes and caching contexts in the arena.
 //
 // Parameters:
-//   szPattern      - Pointer to the character array defining the wildcard pattern.
+//   sPattern      - Pointer to the character array defining the wildcard pattern.
 //   cchPattern     - The length of the pattern in characters.
 //   WildScope      - The boundary scope to apply for wildcard operators.
 //   PatternContext - The user-defined context payload mapped to this specific pattern.
@@ -731,7 +731,7 @@ KmStringPatternMatch<TContext, TChar, PoolType>::KmStringPatternMatch(_In_ bool 
 //   NTSTATUS indicating success, or STATUS_INSUFFICIENT_RESOURCES on memory allocation failure.
 // -------------------------------------------------------------------------------------------
 template <typename TContext, typename TChar, POOL_FLAGS PoolType>
-NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(cchPattern) const TChar* __restrict szPattern,
+NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(cchPattern) const TChar* __restrict sPattern,
                                                                      _In_                   UINT32                  cchPattern,
                                                                      _In_                   WILD_CARD_SCOPE         WildScope,
                                                                      _Inout_                TContext&&              PatternContext)
@@ -763,7 +763,7 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
     
     while (prefixRawLen < cchPattern)
     {
-        TChar c = szPattern[prefixRawLen];
+        TChar c = sPattern[prefixRawLen];
         if (c == kStar || c == kQuestion)
         {
             break;
@@ -773,7 +773,7 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
         {
             if (prefixRawLen + 1 < cchPattern)
             {
-                TChar nextChar = szPattern[prefixRawLen + 1];
+                TChar nextChar = sPattern[prefixRawLen + 1];
                 if (nextChar == kStar || nextChar == kQuestion || nextChar == kEscape)
                 {
                     prefixRawLen       += 2;
@@ -811,11 +811,11 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
         // Populate the unescaped literal prefix
         while (srcIdx < prefixRawLen)
         {
-            TChar c = szPattern[srcIdx];
+            TChar c = sPattern[srcIdx];
             
             if (c == kEscape && srcIdx + 1 < prefixRawLen) [[unlikely]]
             {
-                TChar nextChar = szPattern[srcIdx + 1];
+                TChar nextChar = sPattern[srcIdx + 1];
                 if (nextChar == kStar || nextChar == kQuestion || nextChar == kEscape)
                 {
                     pStableBuffer[dstIdx++] = m_bCaseInsensitive ? KmStringPatternMatchDetail::ToUpperFast(nextChar) : nextChar;
@@ -831,7 +831,7 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
         // Copy raw wildcard suffix verbatim to maintain operator layout for the state machine
         for (UINT32 i = 0; i < cchWildPart; i++)
         {
-            TChar c = szPattern[prefixRawLen + i];
+            TChar c = sPattern[prefixRawLen + i];
             pStableBuffer[dstIdx++] = m_bCaseInsensitive ? KmStringPatternMatchDetail::ToUpperFast(c) : c;
         }
     }
@@ -1170,9 +1170,9 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::Search(_In_reads_(cchT
 // -------------------------------------------------------------------------------------------
 template <typename TContext, typename TChar, POOL_FLAGS PoolType>
 template <bool IsCaseInsensitive>
-bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePrefixMatch(_In_ const PatternEntry&                      pattern, 
-                                                                          _In_reads_(cchLength) const TChar* __restrict sText, 
-                                                                          _In_                  UINT32                  cchLength) const noexcept
+inline bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePrefixMatch(_In_ const PatternEntry&                      pattern, 
+                                                                                 _In_reads_(cchLength) const TChar* __restrict sText, 
+                                                                                 _In_                  UINT32                  cchLength) const noexcept
 {    
     auto Read64Safe = [](const void* ptr) -> UINT64 
     {
@@ -1181,17 +1181,17 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePrefixMatch(_In_ c
         return val;
     };
 
-    if constexpr (IsCaseInsensitive)
+    if (cchLength >= kCharsPerBlock)
     {
-        if (cchLength >= kCharsPerBlock)
+        UINT32 chunks = cchLength / kCharsPerBlock;
+        
+        for (UINT32 i = 0; i < chunks; i++)
         {
-            UINT32 chunks = cchLength / kCharsPerBlock;
+            UINT64 wPat = Read64Safe(pattern.LiteralPrefix.Buffer + (i * kCharsPerBlock));
+            UINT64 wTxt = Read64Safe(sText + (i * kCharsPerBlock));
             
-            for (UINT32 i = 0; i < chunks; i++)
+            if constexpr (IsCaseInsensitive)
             {
-                UINT64 wPat = Read64Safe(pattern.LiteralPrefix.Buffer + (i * kCharsPerBlock));
-                UINT64 wTxt = Read64Safe(sText + (i * kCharsPerBlock));
-                
                 if (KmStringPatternMatchDetail::IsAsciiSWAR<TChar>(wTxt))
                 {
                     if (wPat != KmStringPatternMatchDetail::ToUpperSWAR<TChar>(wTxt))
@@ -1210,14 +1210,24 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePrefixMatch(_In_ c
                     }
                 }
             }
-            
-            if ((cchLength & (kCharsPerBlock - 1)) != 0)
+            else
             {
-                // Overlapping SWAR Tail Comparison: Check remaining characters
-                // via a single 64-bit unaligned load overlapping the end of the prefix.
-                UINT64 wPatTail = Read64Safe(pattern.LiteralPrefix.Buffer + cchLength - kCharsPerBlock);
-                UINT64 wTxtTail = Read64Safe(sText + cchLength - kCharsPerBlock);
-                
+                if (wPat != wTxt)
+                {
+                    return false;
+                }
+            }
+        }
+        
+        if ((cchLength & (kCharsPerBlock - 1)) != 0)
+        {
+            // Overlapping SWAR Tail Comparison: Check remaining characters
+            // via a single 64-bit unaligned load overlapping the end of the prefix.
+            UINT64 wPatTail = Read64Safe(pattern.LiteralPrefix.Buffer + cchLength - kCharsPerBlock);
+            UINT64 wTxtTail = Read64Safe(sText + cchLength - kCharsPerBlock);
+            
+            if constexpr (IsCaseInsensitive)
+            {
                 if (KmStringPatternMatchDetail::IsAsciiSWAR<TChar>(wTxtTail))
                 {
                     if (wPatTail != KmStringPatternMatchDetail::ToUpperSWAR<TChar>(wTxtTail))
@@ -1236,13 +1246,9 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePrefixMatch(_In_ c
                     }
                 }
             }
-        }
-        else
-        {
-            // Fallback loop for prefixes under kCharsPerBlock characters
-            for (UINT32 i = 0; i < cchLength; i++)
+            else
             {
-                if (pattern.LiteralPrefix.Buffer[i] != KmStringPatternMatchDetail::ToUpperFast(sText[i]))
+                if (wPatTail != wTxtTail)
                 {
                     return false;
                 }
@@ -1251,40 +1257,19 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePrefixMatch(_In_ c
     }
     else
     {
-        if (cchLength >= kCharsPerBlock)
+        // Fallback loop for prefixes under kCharsPerBlock characters
+        for (UINT32 i = 0; i < cchLength; i++)
         {
-            UINT32 chunks = cchLength / kCharsPerBlock;
-            
-            for (UINT32 i = 0; i < chunks; i++)
+            if constexpr (IsCaseInsensitive)
             {
-                UINT64 wPat = Read64Safe(pattern.LiteralPrefix.Buffer + (i * kCharsPerBlock));
-                UINT64 wTxt = Read64Safe(sText + (i * kCharsPerBlock));
-
-                if (wPat != wTxt)
+                if (pattern.LiteralPrefix.Buffer[i] != KmStringPatternMatchDetail::ToUpperFast(sText[i]))
                 {
                     return false;
                 }
             }
-            
-            if ((cchLength & (kCharsPerBlock - 1)) != 0)
+            else
             {
-                // Overlapping SWAR Tail Comparison: Check remaining characters
-                // via a single 64-bit unaligned load overlapping the end of the prefix.
-                UINT64 wPatTail = Read64Safe(pattern.LiteralPrefix.Buffer + cchLength - kCharsPerBlock);
-                UINT64 wTxtTail = Read64Safe(sText + cchLength - kCharsPerBlock);
-
-                if (wPatTail != wTxtTail)
-                {
-                    return false;
-                }
-            }
-        }
-        else
-        {
-            // Fallback loop for prefixes under kCharsPerBlock characters
-            for (UINT32 j = 0; j < cchLength; j++)
-            {
-                if (pattern.LiteralPrefix.Buffer[j] != sText[j])
+                if (pattern.LiteralPrefix.Buffer[i] != sText[i])
                 {
                     return false;
                 }
@@ -1309,17 +1294,17 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePrefixMatch(_In_ c
 // -------------------------------------------------------------------------------------------
 template <typename TContext, typename TChar, POOL_FLAGS PoolType>
 template <bool IsCaseInsensitive>
-bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluateTailMatch(_In_ const PatternEntry&                    pattern,
-                                                                        _In_reads_(cchText) const TChar* __restrict sText,
-                                                                        _In_ UINT32                                 cchText) const noexcept
+inline bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluateTailMatch(_In_ const PatternEntry&                    pattern,
+                                                                               _In_reads_(cchText) const TChar* __restrict sText,
+                                                                               _In_ UINT32                                 cchText) const noexcept
 {
     if (pattern.TailAnchor.Length == 0)
     {
         return true;
     }
 
-    const TChar* sTail = sText + (cchText - pattern.TailAnchor.Length);
-    UINT32 tailLen = pattern.TailAnchor.Length;
+    const TChar* sTail   = sText + (cchText - pattern.TailAnchor.Length);
+    UINT32       tailLen = pattern.TailAnchor.Length;
 
     auto Read64Safe = [](const void* ptr) -> UINT64 
     {
@@ -1328,16 +1313,17 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluateTailMatch(_In_ con
         return val;
     };
 
-    if constexpr (IsCaseInsensitive)
+    if (tailLen >= kCharsPerBlock)
     {
-        if (tailLen >= kCharsPerBlock)
+        UINT32 chunks = tailLen / kCharsPerBlock;
+        
+        for (UINT32 i = 0; i < chunks; i++)
         {
-            UINT32 chunks = tailLen / kCharsPerBlock;
-            for (UINT32 i = 0; i < chunks; i++)
+            UINT64 wPat = Read64Safe(pattern.TailAnchor.Buffer + (i * kCharsPerBlock));
+            UINT64 wTxt = Read64Safe(sTail + (i * kCharsPerBlock));
+            
+            if constexpr (IsCaseInsensitive)
             {
-                UINT64 wPat = Read64Safe(pattern.TailAnchor.Buffer + (i * kCharsPerBlock));
-                UINT64 wTxt = Read64Safe(sTail + (i * kCharsPerBlock));
-                
                 if (KmStringPatternMatchDetail::IsAsciiSWAR<TChar>(wTxt))
                 {
                     if (wPat != KmStringPatternMatchDetail::ToUpperSWAR<TChar>(wTxt))
@@ -1356,12 +1342,22 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluateTailMatch(_In_ con
                     }
                 }
             }
-            
-            if ((tailLen & (kCharsPerBlock - 1)) != 0)
+            else
             {
-                UINT64 wPatTail = Read64Safe(pattern.TailAnchor.Buffer + tailLen - kCharsPerBlock);
-                UINT64 wTxtTail = Read64Safe(sTail + tailLen - kCharsPerBlock);
-                
+                if (wPat != wTxt)
+                {
+                    return false;
+                }
+            }
+        }
+        
+        if ((tailLen & (kCharsPerBlock - 1)) != 0)
+        {
+            UINT64 wPatTail = Read64Safe(pattern.TailAnchor.Buffer + tailLen - kCharsPerBlock);
+            UINT64 wTxtTail = Read64Safe(sTail + tailLen - kCharsPerBlock);
+            
+            if constexpr (IsCaseInsensitive)
+            {
                 if (KmStringPatternMatchDetail::IsAsciiSWAR<TChar>(wTxtTail))
                 {
                     if (wPatTail != KmStringPatternMatchDetail::ToUpperSWAR<TChar>(wTxtTail))
@@ -1380,12 +1376,9 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluateTailMatch(_In_ con
                     }
                 }
             }
-        }
-        else
-        {
-            for (UINT32 i = 0; i < tailLen; ++i)
+            else
             {
-                if (pattern.TailAnchor.Buffer[i] != KmStringPatternMatchDetail::ToUpperFast(sTail[i]))
+                if (wPatTail != wTxtTail)
                 {
                     return false;
                 }
@@ -1394,34 +1387,16 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluateTailMatch(_In_ con
     }
     else
     {
-        if (tailLen >= kCharsPerBlock)
+        for (UINT32 i = 0; i < tailLen; ++i)
         {
-            UINT32 chunks = tailLen / kCharsPerBlock;
-            for (UINT32 i = 0; i < chunks; i++)
+            if constexpr (IsCaseInsensitive)
             {
-                UINT64 wPat = Read64Safe(pattern.TailAnchor.Buffer + (i * kCharsPerBlock));
-                UINT64 wTxt = Read64Safe(sTail + (i * kCharsPerBlock));
-
-                if (wPat != wTxt)
+                if (pattern.TailAnchor.Buffer[i] != KmStringPatternMatchDetail::ToUpperFast(sTail[i]))
                 {
                     return false;
                 }
             }
-            
-            if ((tailLen & (kCharsPerBlock - 1)) != 0)
-            {
-                UINT64 wPatTail = Read64Safe(pattern.TailAnchor.Buffer + tailLen - kCharsPerBlock);
-                UINT64 wTxtTail = Read64Safe(sTail + tailLen - kCharsPerBlock);
-
-                if (wPatTail != wTxtTail)
-                {
-                    return false;
-                }
-            }
-        }
-        else
-        {
-            for (UINT32 i = 0; i < tailLen; ++i)
+            else
             {
                 if (pattern.TailAnchor.Buffer[i] != sTail[i])
                 {
@@ -1448,9 +1423,9 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluateTailMatch(_In_ con
 // -------------------------------------------------------------------------------------------
 template <typename TContext, typename TChar, POOL_FLAGS PoolType>
 template <bool IsCaseInsensitive>
-bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePatternSuffix(_In_ const PatternEntry&                    pattern, 
-                                                                            _In_reads_(cchText) const TChar* __restrict sText, 
-                                                                            _In_                UINT32                  cchText) const noexcept
+inline bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePatternSuffix(_In_ const PatternEntry&                    pattern, 
+                                                                                   _In_reads_(cchText) const TChar* __restrict sText, 
+                                                                                   _In_                UINT32                  cchText) const noexcept
 {
     if constexpr (IsCaseInsensitive)
     {
@@ -1505,9 +1480,9 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePatternSuffix(_In_
 // -------------------------------------------------------------------------------------------
 template <typename TContext, typename TChar, POOL_FLAGS PoolType>
 template <bool IsCaseInsensitive, typename F>
-bool KmStringPatternMatch<TContext, TChar, PoolType>::ProcessSlowPath(_In_reads_(cchText) const TChar* __restrict sText, 
-                                                                      _In_                UINT32                  cchText, 
-                                                                      _In_                F&                      Collector) const noexcept
+inline bool KmStringPatternMatch<TContext, TChar, PoolType>::ProcessSlowPath(_In_reads_(cchText) const TChar* __restrict sText, 
+                                                                             _In_                UINT32                  cchText, 
+                                                                             _In_                F&                      Collector) const noexcept
 {
     if (m_SlowPathList.Size() == 0)
     {
@@ -1528,9 +1503,9 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::ProcessSlowPath(_In_reads_
         {
             bool bFound = false;
             
-            if constexpr (IsCaseInsensitive)
+            for (UINT32 i = 0; i < cchText; ++i)
             {
-                for (UINT32 i = 0; i < cchText; ++i)
+                if constexpr (IsCaseInsensitive)
                 {
                     if (KmStringPatternMatchDetail::ToUpperFast(sText[i]) == pattern.FirstLiteralChar)
                     {
@@ -1538,10 +1513,7 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::ProcessSlowPath(_In_reads_
                         break;
                     }
                 }
-            }
-            else
-            {
-                for (UINT32 i = 0; i < cchText; ++i)
+                else
                 {
                     if (sText[i] == pattern.FirstLiteralChar)
                     {
@@ -1691,7 +1663,7 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
                 }
                 else
                 {
-                    UINT64 folded = 0;
+                    UINT64       folded = 0;
                     const TChar* pChunk = sText + (currentChunk * kCharsPerBlock);
 
                     for (UINT32 k = 0; k < kCharsPerBlock; k++)
@@ -1713,19 +1685,16 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
         // Evaluate remaining unaligned characters into a temporary hash without mutating chunkHash
         if (remainingChars > 0)
         {
-            UINT64 tail = 0;
+            UINT64       tail  = 0;
             const TChar* pTail = sText + (targetChunks * kCharsPerBlock);
 
-            if constexpr (IsCaseInsensitive)
+            for (UINT32 j = 0; j < remainingChars; j++)
             {
-                for (UINT32 j = 0; j < remainingChars; j++)
+                if constexpr (IsCaseInsensitive)
                 {
                     tail |= (KmStringPatternMatchDetail::CharToUint64(KmStringPatternMatchDetail::ToUpperFast(pTail[j])) << (j * sizeof(TChar) * 8));
                 }
-            }
-            else
-            {
-                for (UINT32 j = 0; j < remainingChars; j++)
+                else
                 {
                     tail |= (KmStringPatternMatchDetail::CharToUint64(pTail[j]) << (j * sizeof(TChar) * 8));
                 }
@@ -1833,177 +1802,107 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::WildCardMatch(_In_reads_(c
 
     const TChar* lastStarP        = nullptr;
     const TChar* lastStarS        = nullptr;
-    UINT32 starRemainingMinLength = 0;
+    UINT32       starRemainingMinLength = 0;
 
     // Fast-Forward Engine: Propels the evaluation cursor O(N) towards the required sequence 
     // without invoking recursive state transitions inside the wildcard state machine loop.
     auto fastForward = [&](TChar target) -> bool
     {
-        if constexpr (IsCaseInsensitive)
+        auto checkChar = [&](TChar c) -> bool
         {
-            while (s + 3 < StringEnd)
+            if constexpr (IsCaseInsensitive)
             {
-                if (KmStringPatternMatchDetail::ToUpperFast(s[0]) == target) 
-                {
-                    return true;
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[0])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                if (KmStringPatternMatchDetail::ToUpperFast(s[1]) == target) 
-                { 
-                    s += 1; 
-                    return true; 
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[1])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                if (KmStringPatternMatchDetail::ToUpperFast(s[2]) == target) 
-                { 
-                    s += 2; 
-                    return true; 
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[2])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                if (KmStringPatternMatchDetail::ToUpperFast(s[3]) == target) 
-                { 
-                    s += 3; 
-                    return true; 
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[3])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                s += 4;
+                return KmStringPatternMatchDetail::ToUpperFast(c) == target;
+            }
+            else
+            {
+                return c == target;
+            }
+        };
+
+        while (s + 3 < StringEnd)
+        {
+            if (checkChar(s[0])) 
+            {
+                return true;
             }
             
-            while (s < StringEnd)
+            if constexpr (LimitWildScope)
             {
-                if (KmStringPatternMatchDetail::ToUpperFast(*s) == target) 
+                if (KmStringPatternMatchDetail::IsPathSeparator(s[0])) [[unlikely]]
                 {
-                    return true;
+                    return false;
                 }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(*s)) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                s++;
             }
+            
+            if (checkChar(s[1])) 
+            { 
+                s += 1; 
+                return true; 
+            }
+            
+            if constexpr (LimitWildScope)
+            {
+                if (KmStringPatternMatchDetail::IsPathSeparator(s[1])) [[unlikely]]
+                {
+                    return false;
+                }
+            }
+            
+            if (checkChar(s[2])) 
+            { 
+                s += 2; 
+                return true; 
+            }
+            
+            if constexpr (LimitWildScope)
+            {
+                if (KmStringPatternMatchDetail::IsPathSeparator(s[2])) [[unlikely]]
+                {
+                    return false;
+                }
+            }
+            
+            if (checkChar(s[3])) 
+            { 
+                s += 3; 
+                return true; 
+            }
+            
+            if constexpr (LimitWildScope)
+            {
+                if (KmStringPatternMatchDetail::IsPathSeparator(s[3])) [[unlikely]]
+                {
+                    return false;
+                }
+            }
+            
+            s += 4;
         }
-        else
+        
+        while (s < StringEnd)
         {
-            while (s + 3 < StringEnd)
+            if (checkChar(*s)) 
             {
-                if (s[0] == target) 
-                {
-                    return true;
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[0])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                if (s[1] == target) 
-                { 
-                    s += 1; 
-                    return true; 
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[1])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                if (s[2] == target) 
-                { 
-                    s += 2; 
-                    return true; 
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[2])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                if (s[3] == target) 
-                { 
-                    s += 3; 
-                    return true; 
-                }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(s[3])) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                s += 4;
+                return true;
             }
             
-            while (s < StringEnd)
+            if constexpr (LimitWildScope)
             {
-                if (*s == target) 
+                if (KmStringPatternMatchDetail::IsPathSeparator(*s)) [[unlikely]]
                 {
-                    return true;
+                    return false;
                 }
-                
-                if constexpr (LimitWildScope)
-                {
-                    if (KmStringPatternMatchDetail::IsPathSeparator(*s)) [[unlikely]]
-                    {
-                        return false;
-                    }
-                }
-                
-                s++;
             }
+            
+            s++;
         }
         
         return false;
     };
 
-    auto matchChar = [](TChar patChar, TChar strChar) -> bool
+    auto matchChar = [](TChar patChar,
+                        TChar strChar) -> bool
     {
         if constexpr (IsCaseInsensitive)
         {
