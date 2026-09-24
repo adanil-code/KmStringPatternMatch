@@ -230,46 +230,46 @@ enum WILD_CARD_SCOPE : UINT8
 
 namespace KmStringPatternMatchDetail
 {
-    // -------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------
     // Cross-Platform 64x64 -> 128-bit Scalar Mixer
     // Breaks execution dependency chains while providing bit good avalanche.
     //
     // Parameters:
-    //   A - The first 64-bit integer to mix.
-    //   B - The second 64-bit integer (typically a prime) to mix.
+    //   State - The 64-bit integer state to mix with the internal prime constant.
     //
     // Return:
     //   The 64-bit folded result of the 128-bit multiplication.
     // -------------------------------------------------------------------------------------------
-    inline UINT64 Mix64(_In_ UINT64 A,
-                        _In_ UINT64 B) noexcept
+    inline UINT64 Mix64(_In_ UINT64 State) noexcept
     {
-#if defined(_M_X64) || defined(_M_AMD64)
-        UINT64 high;
-        UINT64 low = _umul128(A, B, &high);
-        return low ^ high;
-#elif defined(_M_ARM64)
-        UINT64 high = __umulh(A, B);
-        UINT64 low = A * B;
-        return low ^ high;
-#else
-        // Fallback for 32-bit architectures
-        UINT64 AL = static_cast<UINT32>(A);
-        UINT64 AH = A >> 32;
-        UINT64 BL = static_cast<UINT32>(B);
-        UINT64 BH = B >> 32;
+        constexpr UINT64 kPrime = 0x8bb84b93962eacc9ULL;
 
-        UINT64 LL = AL * BL;
-        UINT64 HL = AH * BL;
-        UINT64 LH = AL * BH;
-        UINT64 HH = AH * BH;
+    #if defined(_M_X64) || defined(_M_AMD64)
+        UINT64 high;
+        UINT64 low = _umul128(State, kPrime, &high);
+        return low ^ high;
+    #elif defined(_M_ARM64) || defined(_M_ARM64EC)
+        UINT64 high = __umulh(State, kPrime);
+        UINT64 low = State * kPrime;
+        return low ^ high;
+    #else
+        // Fallback for 32-bit architectures
+        UINT32 AL = static_cast<UINT32>(State);
+        UINT32 AH = static_cast<UINT32>(State >> 32);
+        constexpr UINT32 BL = static_cast<UINT32>(kPrime);
+        constexpr UINT32 BH = static_cast<UINT32>(kPrime >> 32);
+
+        UINT64 LL = __emulu(AL, BL);
+        UINT64 HL = __emulu(AH, BL);
+        UINT64 LH = __emulu(AL, BH);
+        UINT64 HH = __emulu(AH, BH);
 
         UINT64 cross = (LL >> 32) + static_cast<UINT32>(HL) + static_cast<UINT32>(LH);
         UINT64 upper = (HL >> 32) + (LH >> 32) + (cross >> 32) + HH;
         UINT64 lower = (cross << 32) | static_cast<UINT32>(LL);
 
         return lower ^ upper;
-#endif
+    #endif
     }
 
     // -------------------------------------------------------------------------------------------
@@ -419,8 +419,6 @@ namespace KmStringPatternMatchDetail
                                 _In_                UINT32                  cchText,
                                 _In_                UINT64                  PrevHash) noexcept
     {
-        constexpr UINT64 kPrime = 0x8bb84b93962eacc9ULL;
-
         UINT64 hash   = PrevHash;        
         SIZE_T chunks = (static_cast<SIZE_T>(cchText) * sizeof(TChar)) / 8;
         SIZE_T i = 0;
@@ -429,7 +427,7 @@ namespace KmStringPatternMatchDetail
         {
             UINT64 w;            
             memcpy(&w, sText + (i * (8 / sizeof(TChar))), sizeof(UINT64));
-            hash = Mix64(hash ^ w, kPrime);
+            hash = Mix64(hash ^ w);
         }
 
         UINT32 remainingChars = cchText - static_cast<UINT32>(chunks * (8 / sizeof(TChar)));
@@ -443,7 +441,7 @@ namespace KmStringPatternMatchDetail
                 tail |= (CharToUint64(pTail[j]) << (j * sizeof(TChar) * 8));
             }
 
-            hash = Mix64(hash ^ tail, kPrime);
+            hash = Mix64(hash ^ tail);
         }
 
         return hash;
@@ -1628,8 +1626,6 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
         return val;
     };
 
-    constexpr UINT64 kPrime = 0x8bb84b93962eacc9ULL;
-
     UINT64 chunkHash    = 0;
     SIZE_T currentChunk = 0; // Use SIZE_T to prevent integer overflow bound bypass
 
@@ -1675,7 +1671,7 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
                 }
             }
 
-            chunkHash = KmStringPatternMatchDetail::Mix64(chunkHash ^ w, kPrime);
+            chunkHash = KmStringPatternMatchDetail::Mix64(chunkHash ^ w);
             currentChunk++;
         }
 
@@ -1700,7 +1696,7 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
                 }
             }
 
-            Hash = KmStringPatternMatchDetail::Mix64(chunkHash ^ tail, kPrime);
+            Hash = KmStringPatternMatchDetail::Mix64(chunkHash ^ tail);
         }
 
         // Fast-path rejection via hash-existence filter
