@@ -38,7 +38,7 @@
 //   PoolTag       - The 4-byte tag used for kernel memory tracking.
 //--------------------------------------------------------------------------------
 template <typename T, POOL_FLAGS PoolType = POOL_FLAG_NON_PAGED, SIZE_T BlockCapacity = 512, ULONG PoolTag = 'qeDK'>
-class alignas(64) KDeque
+class KDeque
 {
 private:
 
@@ -115,7 +115,7 @@ public:
         // Allocate a new block dynamically if the current block index is uninitialized.
         if (m_Blocks[blockIndex] == nullptr) [[unlikely]]
         {
-            constexpr POOL_FLAGS allocFlags = PoolType | POOL_FLAG_UNINITIALIZED | POOL_FLAG_CACHE_ALIGNED;
+            constexpr POOL_FLAGS allocFlags = PoolType | POOL_FLAG_UNINITIALIZED;
             
             m_Blocks[blockIndex] = static_cast<T*>(ExAllocatePool2(allocFlags, BlockCapacity * sizeof(T), PoolTag));
             

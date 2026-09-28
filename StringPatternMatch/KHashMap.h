@@ -202,7 +202,7 @@ struct KIdentityHash
 //   PoolTag   - The 4-byte tag used for kernel memory tracking.
 //--------------------------------------------------------------------------------
 template <typename K, typename V, typename Hash = KDefaultHash<K>, ULONG64 PoolFlags = POOL_FLAG_NON_PAGED, ULONG PoolTag = 'amHK'>
-class alignas(64) KFlatHashMap
+class KFlatHashMap
 {
 private:
     // Sentinel value representing an empty, unpopulated slot in the control array.
@@ -342,7 +342,7 @@ public:
         }
 
         const SIZE_T hash  = Hash{}(Key);        
-        SIZE_T       index = hash & (m_Capacity - 1);
+        SIZE_T       index = (hash & (m_Capacity - 1)) & ~(kGroupSize - 1);
         const SIZE_T start = index; 
         const UCHAR  h2    = static_cast<UCHAR>(hash >> 57) & 0x7F; 
 
@@ -350,9 +350,6 @@ public:
         {            
             const UINT64 ctrlBlock = *reinterpret_cast<const __unaligned UINT64*>(&m_Ctrl[index]);
             
-            // Optimized prefetching pipeline two groups ahead to hide memory latency
-            K_PREFETCH(&m_Ctrl[(index + kGroupSize * 2) & (m_Capacity - 1)]);
-
             UINT64 match = SwarMatch(ctrlBlock, h2);
             
             // Check for existing keys colliding with the same H2 metadata byte
@@ -363,7 +360,8 @@ public:
                 
                 const SIZE_T realIdx = (index + (bitPos / 8)) & (m_Capacity - 1);
 
-                // Removed immediate K_PREFETCH(&m_Slots[realIdx]) to eliminate CPU pipeline stalling
+                // Target prefetch into the payload structure for large map evaluations
+                K_PREFETCH(&m_Slots[realIdx]);
 
                 if (m_Slots[realIdx].Key == Key) [[unlikely]]
                 {
@@ -436,13 +434,14 @@ public:
     //--------------------------------------------------------------------------------
     V* Find(_In_ const K& Key) const noexcept
     {
-        if (m_Capacity == 0) [[unlikely]]
+        // Bypass map hashing entirely if there are currently no active elements
+        if (m_Size == 0) [[unlikely]]
         {
             return nullptr;
         }
 
         const SIZE_T hash  = Hash{}(Key);        
-        SIZE_T       index = hash & (m_Capacity - 1);
+        SIZE_T       index = (hash & (m_Capacity - 1)) & ~(kGroupSize - 1);
         const SIZE_T start = index;
         
         const UCHAR h2 = static_cast<UCHAR>(hash >> 57) & 0x7F;
@@ -451,9 +450,6 @@ public:
         {            
             const UINT64 ctrlBlock = *reinterpret_cast<const __unaligned UINT64*>(&m_Ctrl[index]);
             
-            // Optimized prefetching pipeline two groups ahead
-            K_PREFETCH(&m_Ctrl[(index + kGroupSize * 2) & (m_Capacity - 1)]);
-
             UINT64 match = SwarMatch(ctrlBlock, h2);
             
             while (match != 0)
@@ -463,7 +459,8 @@ public:
                 
                 const SIZE_T realIdx = (index + (bitPos / 8)) & (m_Capacity - 1);
                 
-                // Removed immediate K_PREFETCH(&m_Slots[realIdx]) to eliminate CPU pipeline stalling
+                // Target prefetch into the payload structure for large map evaluations
+                K_PREFETCH(&m_Slots[realIdx]);
 
                 if (m_Slots[realIdx].Key == Key) [[likely]]
                 {
@@ -641,6 +638,7 @@ public:
     }
 
 private:
+
     //--------------------------------------------------------------------------------
     // Expands and reorganizes internal memory capacity, migrating items to new slots.
     //
@@ -681,7 +679,7 @@ private:
             return STATUS_INTEGER_OVERFLOW;
         }
 
-        constexpr POOL_FLAGS allocFlags = PoolFlags | POOL_FLAG_UNINITIALIZED | POOL_FLAG_CACHE_ALIGNED;
+        constexpr POOL_FLAGS allocFlags = PoolFlags | POOL_FLAG_UNINITIALIZED;
 
         UCHAR* __restrict pNewCtrl = static_cast<UCHAR*>(ExAllocatePool2(allocFlags, totalAllocSize, PoolTag));        
         if (pNewCtrl == nullptr) [[unlikely]]
@@ -704,7 +702,7 @@ private:
                 if (m_Ctrl[i] != kEmptyCtrl) [[likely]]
                 {
                     const SIZE_T hash = Hash{}(m_Slots[i].Key);                    
-                    SIZE_T index = hash & (NewCapacity - 1);
+                    SIZE_T index = (hash & (NewCapacity - 1)) & ~(kGroupSize - 1);
                     const UCHAR h2 = static_cast<UCHAR>(hash >> 57) & 0x7F;
                     
                     while (true)

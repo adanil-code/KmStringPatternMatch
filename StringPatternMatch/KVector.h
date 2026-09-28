@@ -31,7 +31,7 @@
 //   PoolTag  - The 4-byte tag used for kernel memory tracking.
 //--------------------------------------------------------------------------------
 template <typename T, POOL_FLAGS PoolType = POOL_FLAG_NON_PAGED, ULONG PoolTag = 'ceVK'>
-class alignas(64) KVector
+class KVector
 {
 private:
     //--------------------------------------------------------------------------------
@@ -262,7 +262,7 @@ public:
             return STATUS_INTEGER_OVERFLOW;
         }
 
-        constexpr POOL_FLAGS allocFlags = PoolType | POOL_FLAG_UNINITIALIZED | POOL_FLAG_CACHE_ALIGNED;
+        constexpr POOL_FLAGS allocFlags = PoolType | POOL_FLAG_UNINITIALIZED;
         T* __restrict pNewData = static_cast<T*>(ExAllocatePool2(allocFlags, allocationSize, PoolTag));
         
         if (pNewData == nullptr) [[unlikely]]
