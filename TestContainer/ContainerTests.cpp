@@ -427,17 +427,13 @@ void TestHashMapCorrectness()
     TEST_PASS();
 
     TEST_PHASE("Reserve Pre-allocation");
-    NTSTATUS status = map.Reserve(32);
-    ASSERTMSG("Reserve failed on empty map", NT_SUCCESS(status));
+    NTSTATUS resStatus = map.Reserve(32);
+    ASSERTMSG("Reserve failed on empty map", NT_SUCCESS(resStatus));
     TEST_PASS();
 
     TEST_PHASE("Insert and Find Verification");
-    map.GetOrInsert(100, &pVal);
-
-    if (pVal != nullptr) [[likely]]
-    {
-        *pVal = "Apple";
-    }
+    NTSTATUS status = map.Emplace(100, &pVal, "Apple");
+    ASSERTMSG("Emplace should return STATUS_SUCCESS for new key", status == STATUS_SUCCESS);
 
     // Verify key retention and data alignment
     std::string* __restrict found = map.Find(100);
@@ -446,12 +442,19 @@ void TestHashMapCorrectness()
     ASSERTMSG("Find matched on missing key", map.Find(200) == nullptr);
     TEST_PASS();
 
-    TEST_PHASE("In-Place Value Modification (No Alloc)");
+    TEST_PHASE("In-Place Value Modification & Emplace Overlap");
     std::string* __restrict existingVal = nullptr;
-    // Ask for the exact same key to ensure we return the existing slot instead of duplicating
-    map.GetOrInsert(100, &existingVal);
-    ASSERTMSG("GetOrInsert returned a different pointer for existing key", existingVal == found);
+    
+    // Explicitly test the STATUS_OBJECT_NAME_EXISTS return branch
+    std::string rvalueTest = "Ignored";
+    status = map.Emplace(100, &existingVal, kstd::move(rvalueTest));
+    
+    ASSERTMSG("Emplace failed to return EXISTS status", status == STATUS_OBJECT_NAME_EXISTS);
+    ASSERTMSG("Emplace returned a different pointer for existing key", existingVal == found);
+    ASSERTMSG("Emplace incorrectly consumed the rvalue", rvalueTest == "Ignored");
+    ASSERTMSG("Emplace incorrectly overwrote the existing value", *existingVal == "Apple");
 
+    // Mutate the final element directly via reference
     *existingVal = "Banana";
     ASSERTMSG("Value update failed", *map.Find(100) == "Banana");
     TEST_PASS();
@@ -459,7 +462,7 @@ void TestHashMapCorrectness()
     TEST_PHASE("Rehashing Integrity");
     for (UINT64 i = 1; i <= 10; i++)
     {
-        map.GetOrInsert(i, &pVal);
+        map.Emplace(i, &pVal, "Apple");
     }
 
     // Ensures keys were successfully migrated into the new larger layout
@@ -472,7 +475,7 @@ void TestHashMapCorrectness()
     {
         KFlatHashMap<decltype(key), int> testMap;
         int* __restrict val = nullptr;
-        testMap.GetOrInsert(key, &val);
+        testMap.Emplace(key, &val, 0);
         ASSERTMSG(errorMsg, testMap.Find(key) != nullptr);
     };
 
@@ -491,17 +494,8 @@ void TestHashMapCorrectness()
         ComplexKey k2 = {0x444, 0x555, 0x666};
 
         int* __restrict pComplexVal = nullptr;
-        complexMap.GetOrInsert(k1, &pComplexVal);
-        if (pComplexVal != nullptr) [[likely]]
-        {
-            *pComplexVal = 42;
-        }
-
-        complexMap.GetOrInsert(k2, &pComplexVal);
-        if (pComplexVal != nullptr) [[likely]]
-        {
-            *pComplexVal = 84;
-        }
+        complexMap.Emplace(k1, &pComplexVal, 42);
+        complexMap.Emplace(k2, &pComplexVal, 84);
 
         int* found1 = complexMap.Find(k1);
         ASSERTMSG("Complex key 1 lookup failed", found1 != nullptr && *found1 == 42);
@@ -522,17 +516,8 @@ void TestHashMapCorrectness()
         SwarTailKey k2 = {4, 5, 6};
 
         int* __restrict pTailVal = nullptr;
-        tailMap.GetOrInsert(k1, &pTailVal);
-        if (pTailVal != nullptr) [[likely]]
-        {
-            *pTailVal = 100;
-        }
-
-        tailMap.GetOrInsert(k2, &pTailVal);
-        if (pTailVal != nullptr) [[likely]]
-        {
-            *pTailVal = 200;
-        }
+        tailMap.Emplace(k1, &pTailVal, 100);
+        tailMap.Emplace(k2, &pTailVal, 200);
 
         int* found1 = tailMap.Find(k1);
         ASSERTMSG("SWAR tail key 1 lookup failed", found1 != nullptr && *found1 == 100);
@@ -550,19 +535,19 @@ void TestHashMapCorrectness()
         // Tests 16-bit identity passthrough
         KFlatHashMap<UINT16, int, KIdentityHash<UINT16>> mapIdentity16;
         int* __restrict vId16 = nullptr;
-        mapIdentity16.GetOrInsert(static_cast<UINT16>(42), &vId16);
+        mapIdentity16.Emplace(static_cast<UINT16>(42), &vId16, 0);
         ASSERTMSG("Identity hash (16-bit) failed", mapIdentity16.Find(static_cast<UINT16>(42)) != nullptr);
 
         // Tests 32-bit identity passthrough
         KFlatHashMap<UINT32, int, KIdentityHash<UINT32>> mapIdentity32;
         int* __restrict vId32 = nullptr;
-        mapIdentity32.GetOrInsert(static_cast<UINT32>(0xDEADBEEF), &vId32);
+        mapIdentity32.Emplace(static_cast<UINT32>(0xDEADBEEF), &vId32, 0);
         ASSERTMSG("Identity hash (32-bit) failed", mapIdentity32.Find(static_cast<UINT32>(0xDEADBEEF)) != nullptr);
 
         // Tests 64-bit identity passthrough
         KFlatHashMap<UINT64, int, KIdentityHash<UINT64>> mapIdentity64;
         int* __restrict vId64 = nullptr;
-        mapIdentity64.GetOrInsert(0xABCDEF1234567890ULL, &vId64);
+        mapIdentity64.Emplace(0xABCDEF1234567890ULL, &vId64, 0);
         ASSERTMSG("Identity hash (64-bit) failed", mapIdentity64.Find(0xABCDEF1234567890ULL) != nullptr);
     }
     TEST_PASS();
@@ -577,11 +562,7 @@ void TestHashMapCorrectness()
         for (UINT64 i = 0; i < 100; i++)
         {
             UINT64 precomputedKey = (i << 32) | i;
-            mapPrecomputed.GetOrInsert(precomputedKey, &vPre);
-            if (vPre != nullptr) [[likely]]
-            {
-                *vPre = static_cast<int>(i);
-            }
+            mapPrecomputed.Emplace(precomputedKey, &vPre, static_cast<int>(i));
         }
 
         int* foundVal = mapPrecomputed.Find((50ULL << 32) | 50ULL);
@@ -598,12 +579,8 @@ void TestHashMapCorrectness()
 
     for (UINT64 i = 0; i < 12; i++)
     {
-        collisionMap.GetOrInsert(i, &pColVal);
-
-        if (pColVal != nullptr) [[likely]]
-        {
-            *pColVal = static_cast<int>(i) * 10;
-        }
+        NTSTATUS colStatus = collisionMap.Emplace(i, &pColVal, static_cast<int>(i) * 10);
+        ASSERTMSG("Collision emplace failed", colStatus == STATUS_SUCCESS);
     }
 
     for (UINT64 i = 0; i < 12; i++)
@@ -616,12 +593,7 @@ void TestHashMapCorrectness()
     TEST_PHASE("Iterator Operator->");
     KFlatHashMap<UINT64, std::string> iterMap;
     std::string* __restrict pIterStr = nullptr;
-    iterMap.GetOrInsert(777, &pIterStr);
-
-    if (pIterStr != nullptr) [[likely]]
-    {
-        *pIterStr = "Lucky";
-    }
+    iterMap.Emplace(777, &pIterStr, "Lucky");
 
     auto it = iterMap.begin();
     ASSERTMSG("Iterator begin failed", it != iterMap.end());
@@ -806,12 +778,7 @@ void BenchmarkMapLookupsComparison(const std::string& sizeLabel, UINT64 mapSize,
 
     for (UINT64 i = 0; i < mapSize; i++)
     {
-        mapK.GetOrInsert(i, &pVal);
-        
-        if (pVal != nullptr) [[likely]]
-        {
-            *pVal = static_cast<int>(i);
-        }
+        mapK.Emplace(i, &pVal, static_cast<int>(i));
     }
 
     // Setup std::unordered_map
@@ -1073,7 +1040,7 @@ void RunPerformanceTests()
         mapAutoK.Clear();
         for (UINT64 i = 0; i < kChunkSize; i++)
         {
-            mapAutoK.GetOrInsert(i, &pMapVal);
+            mapAutoK.Emplace(i, &pMapVal, 0);
         }
     };
 
@@ -1098,7 +1065,7 @@ void RunPerformanceTests()
         mapResK.Clear();
         for (UINT64 i = 0; i < kChunkSize; i++)
         {
-            mapResK.GetOrInsert(i, &pMapVal);
+            mapResK.Emplace(i, &pMapVal, 0);
         }
     };
 

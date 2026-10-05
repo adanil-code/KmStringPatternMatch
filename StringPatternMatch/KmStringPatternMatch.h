@@ -675,7 +675,7 @@ private:
     UINT32 m_nGlobalMinMatchLength; // Global minimum required character length across all registered patterns
     bool   m_bWildCardPresent;      // True if any registered pattern contains wildcard operators
     bool   m_bCaseInsensitive;      // True if matches are evaluated case-insensitively
-    UINT64 m_HashFilter[8];         // 512-bit hash-existence filter bitmap array
+    UINT64 m_HashFilter[16];        // 1024-bit hash-existence filter bitmap array
 
     KVector<UINT32, PoolType>     m_LengthVec;    // Sorted unique literal prefix lengths
     KStringArena<TChar, PoolType> m_StringArena;  // Linear arena storing persistent pattern strings
@@ -1045,9 +1045,9 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
         return status;
     }
 
-    // Distribute bits via shifted segment map across the 512-bit array
+    // Distribute bits via shifted segment map across the 1024-bit array
     // Defers hash-existence filter mutation until the entire insertion transaction is guaranteed to succeed
-    SPM_BIT_TEST_AND_SET64(m_HashFilter[(hash >> 6) & 7], hash & 63);
+    SPM_BIT_TEST_AND_SET64(m_HashFilter[(hash >> 6) & 15], hash & 63);
 
     return STATUS_SUCCESS;
 }
@@ -1068,7 +1068,7 @@ void KmStringPatternMatch<TContext, TChar, PoolType>::Clear() noexcept
     m_nGlobalMinMatchLength = MAXUINT32;
     m_bWildCardPresent      = false;
     
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 16; i++)
     {
         m_HashFilter[i] = 0;
     }
@@ -1699,7 +1699,7 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
         }
 
         // Fast-path rejection via hash-existence filter
-        if (!SPM_BIT_TEST64(m_HashFilter[(Hash >> 6) & 7], Hash & 63)) [[likely]]
+        if (!SPM_BIT_TEST64(m_HashFilter[(Hash >> 6) & 15], Hash & 63)) [[likely]]
         {
             continue;
         }

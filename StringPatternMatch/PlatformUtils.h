@@ -246,5 +246,12 @@ namespace kstd
 
     template <typename T>
     inline constexpr bool is_trivially_destructible_v = __is_trivially_destructible(T);
+
+    //--------------------------------------------------------------------------------
+    // Determines if a type has unique object representations (no padding bytes),
+    // ensuring the type can be safely and reliably hashed byte-by-byte.
+    //--------------------------------------------------------------------------------
+    template <typename T>
+    inline constexpr bool has_unique_object_representations_v = __has_unique_object_representations(T);
 }
 #endif

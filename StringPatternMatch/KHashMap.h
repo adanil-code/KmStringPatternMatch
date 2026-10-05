@@ -51,6 +51,7 @@ struct KDefaultHash
 
     //--------------------------------------------------------------------------------
     // Computes the hash for the given key based on its structural size.
+    // Memory is copied to bypass C++ strict aliasing violations.
     //
     // Parameters:
     //   Key - The structural element being hashed.
@@ -63,44 +64,53 @@ struct KDefaultHash
         if constexpr (sizeof(T) == 8)
         {
             // Scalar path for 64-bit integers, pointers, handles, and 8-byte structures.            
-            const UINT64 val = *reinterpret_cast<const __unaligned UINT64*>(&Key);
+            UINT64 val;
+            RtlCopyMemory(&val, &Key, sizeof(UINT64));
             return static_cast<SIZE_T>(Mix64(val));
         }
         else if constexpr (sizeof(T) == 4)
         {
             // Scalar path for 32-bit integers, ULONGs, NTSTATUS codes, etc.
-            const UINT32 val = *reinterpret_cast<const __unaligned UINT32*>(&Key);
+            UINT32 val;
+            RtlCopyMemory(&val, &Key, sizeof(UINT32));
             return static_cast<SIZE_T>(Mix64(static_cast<UINT64>(val)));
         }
         else if constexpr (sizeof(T) == 2)
         {
             // Scalar path for 16-bit integers, USHORT, WCHAR, etc.
-            const UINT16 val = *reinterpret_cast<const __unaligned UINT16*>(&Key);
+            UINT16 val;
+            RtlCopyMemory(&val, &Key, sizeof(UINT16));
             return static_cast<SIZE_T>(Mix64(static_cast<UINT64>(val)));
         }
         else if constexpr (sizeof(T) == 1)
         {
             // Scalar path for 8-bit integers, CHAR, UCHAR, bool.
-            const UCHAR val = *reinterpret_cast<const UCHAR*>(&Key);
+            UCHAR val;
+            RtlCopyMemory(&val, &Key, sizeof(UCHAR));
             return static_cast<SIZE_T>(Mix64(static_cast<UINT64>(val)));
         }
         else if constexpr (sizeof(T) == 16)
         {
             // Branchless fast path for 128-bit types (GUID, LUID pairs, IPv6 addresses).
             // Asymmetric mixing prevents commutativity (k1 ^ k2 != k2 ^ k1).
-            const __unaligned UINT64* p64 = reinterpret_cast<const __unaligned UINT64*>(&Key);
+            UINT64 p64[2];
+            RtlCopyMemory(p64, &Key, sizeof(p64));
             return static_cast<SIZE_T>(Mix64(p64[0] ^ Mix64(p64[1])));
         }
         else
         {
-            // High-speed SWAR 64-bit block chunking for arbitrary structs and memory buffers.            
+            // High-speed SWAR 64-bit block chunking for arbitrary structs and memory buffers.
+            static_assert(kstd::has_unique_object_representations_v<T>, 
+                "KDefaultHash generic struct fallback requires types without uninitialized compiler padding to prevent hash entropy leaks.");
+            
             const unsigned char* p = reinterpret_cast<const unsigned char*>(&Key);
             UINT64 hash = 0xCBF29CE484222325ULL ^ (static_cast<UINT64>(sizeof(T)) * 0x9E3779B97F4A7C15ULL);
             SIZE_T i = 0;
 
             for (; i + 8 <= sizeof(T); i += 8)
             {
-                const UINT64 chunk = *reinterpret_cast<const __unaligned UINT64*>(p + i);
+                UINT64 chunk;
+                RtlCopyMemory(&chunk, p + i, sizeof(UINT64));
                 hash = (hash ^ chunk) * 0x100000001B3ULL;
                 hash ^= (hash >> 31);
             }
@@ -169,25 +179,33 @@ struct KIdentityHash
     {
         if constexpr (sizeof(T) == 8)
         {
-            return static_cast<SIZE_T>(*reinterpret_cast<const __unaligned UINT64*>(&Key));
+            UINT64 val;
+            RtlCopyMemory(&val, &Key, sizeof(UINT64));
+            return static_cast<SIZE_T>(val);
         }
         else if constexpr (sizeof(T) == 4)
         {
-            return static_cast<SIZE_T>(*reinterpret_cast<const __unaligned UINT32*>(&Key));
+            UINT32 val;
+            RtlCopyMemory(&val, &Key, sizeof(UINT32));
+            return static_cast<SIZE_T>(val);
         }
         else if constexpr (sizeof(T) == 2)
         {
-            return static_cast<SIZE_T>(*reinterpret_cast<const __unaligned UINT16*>(&Key));
+            UINT16 val;
+            RtlCopyMemory(&val, &Key, sizeof(UINT16));
+            return static_cast<SIZE_T>(val);
         }
         else
         {
-            return static_cast<SIZE_T>(*reinterpret_cast<const UCHAR*>(&Key));
+            UCHAR val;
+            RtlCopyMemory(&val, &Key, sizeof(UCHAR));
+            return static_cast<SIZE_T>(val);
         }
     }
 };
 
 //--------------------------------------------------------------------------------
-// KFlatHashMap is an open-addressing hash table leveraging SIMD Within 
+// KFlatHashMap is an open-addressing append-only hash table leveraging SIMD Within 
 // A Register (SWAR) optimization. Modeled after SwissTable/F14 architectures, it 
 // partitions its footprint into an array of 1-byte metadata entries (m_Ctrl) and 
 // an array of key-value pairs (m_Slots). Lookups fetch 8 control bytes at once, 
@@ -213,7 +231,7 @@ private:
 
     struct Slot
     {        
-        K Key;   // The unique key used to index the hash map.               
+        K Key;   // The unique key used to index the hash map.                
         V Value; // The data value mapped to the unique key.
     };
 
@@ -315,13 +333,22 @@ public:
     // Emplacing mechanism constructing value in-place, bypassing redundant default 
     // initialization.
     //
+    // IMPORTANT RESOURCE LIFECYCLE NOTE:
+    //   If the key already exists in the map, this function returns 
+    //   STATUS_OBJECT_NAME_EXISTS. In this scenario, variadic arguments passed via 
+    //   kstd::move() are NOT consumed. The caller retains ownership of these 
+    //   resources and is strictly responsible for freeing them to prevent kernel 
+    //   memory leaks.
+    //
     // Parameters:
     //   Key      - The map key indexing the element.
-    //   OutValue - Double-pointer receiving the constructed value's memory address.
+    //   OutValue - Double-pointer receiving the constructed or existing value's 
+    //              memory address.
     //   args     - Variadic template parameters for the constructed value object.
     //
     // Return:
-    //   STATUS_SUCCESS on placement completion or NTSTATUS on memory constraints.
+    //   STATUS_SUCCESS on new placement, STATUS_OBJECT_NAME_EXISTS if the key 
+    //   already exists, or an error NTSTATUS on memory constraints.
     //--------------------------------------------------------------------------------
     template <typename... Args>
     NTSTATUS Emplace(_In_                           const K& Key,
@@ -330,8 +357,9 @@ public:
     {
         *OutValue = nullptr;
 
-        // Optimized load factor threshold bumped to 75% for better memory density
-        if (m_Size * 4 >= m_Capacity * 3) [[unlikely]]
+        // Optimized load factor threshold bumped to 70% to prevent degraded linear probe chains
+        // before hash table scaling evaluates sizing constraints
+        if (m_Size * 10 >= m_Capacity * 7) [[unlikely]]
         {
             const SIZE_T newCap = (m_Capacity == 0) ? 16 : m_Capacity * 2;
             NTSTATUS status = Rehash(newCap);
@@ -349,7 +377,6 @@ public:
         while (true)
         {            
             const UINT64 ctrlBlock = *reinterpret_cast<const __unaligned UINT64*>(&m_Ctrl[index]);
-            
             UINT64 match = SwarMatch(ctrlBlock, h2);
             
             // Check for existing keys colliding with the same H2 metadata byte
@@ -358,37 +385,30 @@ public:
                 unsigned long bitPos;
                 _BitScanForward64(&bitPos, match);
                 
-                const SIZE_T realIdx = (index + (bitPos / 8)) & (m_Capacity - 1);
-
-                // Target prefetch into the payload structure for large map evaluations
-                K_PREFETCH(&m_Slots[realIdx]);
+                const SIZE_T realIdx = index + (bitPos / 8);
 
                 if (m_Slots[realIdx].Key == Key) [[unlikely]]
                 {
                     *OutValue = &m_Slots[realIdx].Value;
-                    return STATUS_SUCCESS;
+                    
+                    // Return informational status so callers know variadic args were not consumed
+                    return STATUS_OBJECT_NAME_EXISTS; 
                 }
                 
                 match &= match - 1;
             }
 
             // Find an empty slot using the zero-latency MSB shortcut.
-            // Valid h2 bytes are clamped to 0x7F (MSB=0). kEmptyCtrl is 0xFF (MSB=1).
             UINT64 empty = ctrlBlock & 0x8080808080808080ULL;            
             if (empty != 0) [[likely]]
             {
                 unsigned long bitPos;
                 _BitScanForward64(&bitPos, empty);
                 
-                const SIZE_T realIdx = (index + (bitPos / 8)) & (m_Capacity - 1);
+                // Since index is strictly aligned, index + bitPos/8 is guaranteed to never overflow m_Capacity
+                const SIZE_T realIdx = index + (bitPos / 8);
                 
                 m_Ctrl[realIdx] = h2;
-                
-                // Replicate control bytes to the end to optimize boundary wrap-around checks
-                if (realIdx < kGroupSize) [[unlikely]]
-                {
-                    m_Ctrl[m_Capacity + realIdx] = h2;
-                }
                 
                 new (&m_Slots[realIdx].Key)   K(Key);
                 new (&m_Slots[realIdx].Value) V(kstd::forward<Args>(args)...);
@@ -398,7 +418,7 @@ public:
                 return STATUS_SUCCESS;
             }
 
-            // Linear probe to the next group of 8 slots
+            // Hardware-friendly linear probing
             index = (index + kGroupSize) & (m_Capacity - 1);            
             if (index == start) [[unlikely]]
             {
@@ -410,12 +430,18 @@ public:
     //--------------------------------------------------------------------------------
     // Fetches an existing value or inserts a newly constructed one.
     //
+    // IMPORTANT RESOURCE LIFECYCLE NOTE:
+    //   Returns STATUS_OBJECT_NAME_EXISTS if the key is already present. Callers 
+    //   forwarding r-values must check for this specific status code and manually 
+    //   cleanup their unconsumed resources.
+    //
     // Parameters:
     //   Key      - The mapped entry identifier to lookup or create.
     //   OutValue - Receives a mutable pointer mapped to the object's memory.
     //
     // Return:
-    //   STATUS_SUCCESS or corresponding NTSTATUS on failed resource allocation.
+    //   STATUS_SUCCESS on creation, STATUS_OBJECT_NAME_EXISTS if found, or 
+    //   an error NTSTATUS on failed resource allocation.
     //--------------------------------------------------------------------------------
     NTSTATUS GetOrInsert(_In_                          const K& Key,
                          _Outptr_result_nullonfailure_ V**      OutValue) noexcept
@@ -443,13 +469,11 @@ public:
         const SIZE_T hash  = Hash{}(Key);        
         SIZE_T       index = (hash & (m_Capacity - 1)) & ~(kGroupSize - 1);
         const SIZE_T start = index;
-        
-        const UCHAR h2 = static_cast<UCHAR>(hash >> 57) & 0x7F;
+        const UCHAR  h2    = static_cast<UCHAR>(hash >> 57) & 0x7F;
 
         while (true)
         {            
             const UINT64 ctrlBlock = *reinterpret_cast<const __unaligned UINT64*>(&m_Ctrl[index]);
-            
             UINT64 match = SwarMatch(ctrlBlock, h2);
             
             while (match != 0)
@@ -457,10 +481,7 @@ public:
                 unsigned long bitPos;
                 _BitScanForward64(&bitPos, match);
                 
-                const SIZE_T realIdx = (index + (bitPos / 8)) & (m_Capacity - 1);
-                
-                // Target prefetch into the payload structure for large map evaluations
-                K_PREFETCH(&m_Slots[realIdx]);
+                const SIZE_T realIdx = index + (bitPos / 8);
 
                 if (m_Slots[realIdx].Key == Key) [[likely]]
                 {
@@ -473,7 +494,6 @@ public:
             // High-speed empty block detection: 
             // Valid h2 metadata bytes are strictly 7-bit (MSB = 0).
             // Empty control bytes (0xFF) are the only bytes with the MSB set.
-            // Bypasses SwarMatch overhead entirely.
             if ((ctrlBlock & 0x8080808080808080ULL) != 0) [[likely]]
             {
                 return nullptr;
@@ -505,11 +525,6 @@ public:
                     m_Slots[i].Key.~K();
                     m_Slots[i].Value.~V();
                     m_Ctrl[i] = kEmptyCtrl;
-                    
-                    if (i < kGroupSize) [[unlikely]]
-                    {
-                        m_Ctrl[m_Capacity + i] = kEmptyCtrl;
-                    }
                 }
             }
         }
@@ -649,32 +664,30 @@ private:
     //   STATUS_SUCCESS on memory operation success.
     //--------------------------------------------------------------------------------
     NTSTATUS Rehash(_In_ SIZE_T NewCapacity) noexcept
-    {
-        SIZE_T ctrlBytes      = 0;
+    {        
+        SIZE_T ctrlBytes      = NewCapacity;
         SIZE_T slotBytes      = 0;
+        SIZE_T slotAlign      = alignof(Slot);
+        SIZE_T maxPadding     = slotAlign - 1;
+        
+        // Re-introduce padding baseline separation for optimal cache lane separation
         SIZE_T slotsOffset    = 0;
         SIZE_T totalAllocSize = 0;
 
-        if (!NT_SUCCESS(RtlSizeTAdd(NewCapacity, kGroupSize, &ctrlBytes))) [[unlikely]]
+        if (!NT_SUCCESS(RtlSizeTAdd(ctrlBytes, 63, &slotsOffset))) [[unlikely]]
         {
             return STATUS_INTEGER_OVERFLOW;
         }
         
-        SIZE_T unalignedOffset = 0;
-        
-        if (!NT_SUCCESS(RtlSizeTAdd(ctrlBytes, 63, &unalignedOffset))) [[unlikely]]
-        {
-            return STATUS_INTEGER_OVERFLOW;
-        }
-        
-        slotsOffset = unalignedOffset & ~63ULL;
-        
+        slotsOffset = slotsOffset & ~63ULL;
+
         if (!NT_SUCCESS(RtlSizeTMult(NewCapacity, sizeof(Slot), &slotBytes))) [[unlikely]]
         {
             return STATUS_INTEGER_OVERFLOW;
         }
 
-        if (!NT_SUCCESS(RtlSizeTAdd(slotsOffset, slotBytes, &totalAllocSize))) [[unlikely]]
+        if (!NT_SUCCESS(RtlSizeTAdd(slotsOffset, maxPadding, &totalAllocSize)) ||
+            !NT_SUCCESS(RtlSizeTAdd(totalAllocSize, slotBytes, &totalAllocSize))) [[unlikely]]
         {
             return STATUS_INTEGER_OVERFLOW;
         }
@@ -687,9 +700,11 @@ private:
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        Slot* __restrict pNewSlots = reinterpret_cast<Slot*>(pNewCtrl + slotsOffset);
+        UINT_PTR ctrlAddr  = reinterpret_cast<UINT_PTR>(pNewCtrl);
+        UINT_PTR slotsAddr = (ctrlAddr + slotsOffset + maxPadding) & ~maxPadding;
+        Slot* __restrict pNewSlots = reinterpret_cast<Slot*>(slotsAddr);
 
-        for (SIZE_T i = 0; i < NewCapacity + kGroupSize; i++)
+        for (SIZE_T i = 0; i < NewCapacity; i++)
         {
             pNewCtrl[i] = kEmptyCtrl;
         }
@@ -708,22 +723,15 @@ private:
                     while (true)
                     {                        
                         const UINT64 ctrlBlock = *reinterpret_cast<const __unaligned UINT64*>(&pNewCtrl[index]);
-                        
-                        // Use MSB shortcut to quickly find the new empty target slot
                         UINT64 empty = ctrlBlock & 0x8080808080808080ULL;
                         
                         if (empty != 0) [[likely]]
                         {
                             unsigned long bitPos;
                             _BitScanForward64(&bitPos, empty);
-                            SIZE_T realIdx = (index + (bitPos / 8)) & (NewCapacity - 1);
                             
+                            SIZE_T realIdx = index + (bitPos / 8);
                             pNewCtrl[realIdx] = h2;
-                            
-                            if (realIdx < kGroupSize) [[unlikely]]
-                            {
-                                pNewCtrl[NewCapacity + realIdx] = h2;
-                            }
                             
                             new (&pNewSlots[realIdx].Key)   K(kstd::move(m_Slots[i].Key));
                             new (&pNewSlots[realIdx].Value) V(kstd::move(m_Slots[i].Value));
@@ -749,7 +757,7 @@ private:
     }
 
 private:    
-    UCHAR* m_Ctrl;     // Pointer to the control byte array mapping H2 metadata and empty slots.       
+    UCHAR* m_Ctrl;     // Pointer to the control byte array mapping H2 metadata and empty slots.        
     Slot*  m_Slots;    // Pointer to the array holding the mapped Key/Value structures.        
     SIZE_T m_Capacity; // The current maximum number of elements the map can hold before expanding.        
     SIZE_T m_Size;     // The current count of actively stored elements in the map.

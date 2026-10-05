@@ -46,6 +46,10 @@ typedef uint64_t POOL_FLAGS;
 #ifndef STATUS_BUFFER_TOO_SMALL
 #define STATUS_BUFFER_TOO_SMALL       0xC0000023
 #endif
+#ifndef STATUS_OBJECT_NAME_EXISTS
+#define STATUS_OBJECT_NAME_EXISTS     0x40000000
+#endif
+
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status)            (((NTSTATUS)(Status)) >= 0)
 #endif

@@ -33,7 +33,7 @@ To support precision file system filtering, the engine natively implements path 
 * **Hardware Support:** Provides architecture-specific x64 and ARM64 implementations for the low-level hashing and bit-manipulation primitives.
 * **Allocation-Free Matching Path:** After registration, the matcher performs no internal pool allocations during candidate evaluation. The caller-provided output vector for `Search(..., PatternContexts)` may still allocate as it grows.
 * **Pattern Capacity Limit:** To prevent unbounded kernel memory exhaustion, the engine is constrained by a strict capacity limit of 131,072 registered patterns per instance.
-* **Hash-Existence Filter Rejection:** Uses a 512-bit hash-existence filter to discard non-matching target strings before expensive character comparisons occur.
+* **Hash-Existence Filter Rejection:** Uses a 1024-bit hash-existence filter to discard non-matching target strings before expensive character comparisons occur.
 * **SWAR Literal Evaluation:** SIMD Within A Register (SWAR) techniques process up to 8 characters simultaneously via 64-bit operations.
 * **Non-Recursive State Machine:** Windows kernel-mode execution has a tightly constrained stack (approximately three pages on supported configurations). This engine avoids recursive stack growth, keeping wildcard evaluation independent of input-driven recursion depth; callers requiring additional stack space can use the documented kernel stack-expansion mechanisms.
 * **IRQL Compatibility:** May be used at `DISPATCH_LEVEL`, provided the matcher, pattern data, target buffer, and all other accessed memory are resident/nonpaged and the configured pool type is appropriate for that IRQL.
@@ -47,7 +47,7 @@ To support precision file system filtering, the engine natively implements path 
 
 ### High-Level Design
 The engine uses a two-phase architecture: registration-time preprocessing and search-time candidate evaluation to maximize CPU efficiency:
-1. **Registration Phase:** When a pattern is added, the engine parses it into an exact *literal prefix* and a *wildcard suffix*. The literal prefix is case-folded (if configured), hashed, and mapped into a SwissTable-style hash map, while the user's context payload is stored in a segmented deque. The pattern's trailing literal segment (tail anchor) and minimum required match length are precalculated and cached. The prefix hash is then stamped into a 512-bit hash-existence filter. Note: `AddPattern()` and `Clear()` mutate the internal structures, while `Search()` reads them; callers must ensure proper external synchronization if modifying the engine concurrently.
+1. **Registration Phase:** When a pattern is added, the engine parses it into an exact *literal prefix* and a *wildcard suffix*. The literal prefix is case-folded (if configured), hashed, and mapped into a SwissTable-style hash map, while the user's context payload is stored in a segmented deque. The pattern's trailing literal segment (tail anchor) and minimum required match length are precalculated and cached. The prefix hash is then stamped into a 1024-bit hash-existence filter. Note: `AddPattern()` and `Clear()` mutate the internal structures, while `Search()` reads them; callers must ensure proper external synchronization if modifying the engine concurrently.
 2. **Search Phase:** As target text arrives, the engine performs a global minimum length bounds check, followed by an incremental block hash. It checks the hash-existence filter first. If the corresponding bit is set, it probes the hash map to retrieve potential pattern candidates. For each candidate, it verifies the minimum match length, checks the anchored literal tail, and performs an exact SWAR comparison on the literal prefix. If the prefix matches, it hands the remaining unparsed text over to the non-recursive wildcard state machine. If the wildcards match, the saved context payload is returned.
 
 ### 1. Custom WDK Container Ecosystem
@@ -63,7 +63,7 @@ Unlike rolling hash algorithms (e.g., Hornet or Rabin-Karp), the engine utilizes
 To eliminate this overhead, the engine intentionally relies on a scalar, GPR-only WyHash implementation. Profiling during development confirmed that scalar WyHash consistently outperforms scalar rolling Hornet implementations, executing entirely within 64-bit general-purpose registers without incurring floating-point or vector state save penalties.
 * The text is loaded into 64-bit unaligned chunks and processed via a cross-platform 128-bit multiplication folder (`Mix64`).
 * The architecture-specific implementations use hardware intrinsics (`_umul128` on x64, `__umulh` on ARM64) to perform the 128-bit multiplication/mixing operations.
-* The resulting 64-bit hash feeds directly into a **512-bit hash-existence filter bitmap array** (`m_HashFilter`). This serves as a high-speed fast-path rejection mechanism, allowing the engine to discard incoming string targets that do not generate valid hashes for any registered pattern prefix.
+* The resulting 64-bit hash feeds directly into a **1024-bit hash-existence filter bitmap array** (`m_HashFilter`). This serves as a high-speed fast-path rejection mechanism, allowing the engine to discard incoming string targets that do not generate valid hashes for any registered pattern prefix.
 
 ### 3. Overlapping 64-bit SWAR Literal Evaluation & Anchored Tail Filtering
 For literal pattern prefixes and anchored suffixes, the engine leverages SIMD Within A Register (SWAR) chunking rather than sequential character-by-character comparisons:
@@ -316,17 +316,17 @@ Evaluating realistic paths requires an initial prefix hash lookup followed by a 
 <table border="0" cellspacing="0" cellpadding="0">
   <tr>
     <td align="center" valign="middle" width="50%">
-      <img src="Assets/exact_string_scaling_1165G7.png" width="680" alt="Intel Core i7-1165G7 Exact String Scaling Performance">
+      <img src="assets/exact_string_scaling_1165G7.png" width="680" alt="Intel Core i7-1165G7 Exact String Scaling Performance">
       <br><em>Figure 3: Bare-Metal (Intel Core i7-1165G7)</em>
     </td>
     <td align="center" valign="middle" width="50%">
-      <img src="Assets/exact_string_scaling_8086K.png" width="680" alt="Intel Core i7-8086K Virtualized Guest Exact String Performance">
+      <img src="assets/exact_string_scaling_8086K.png" width="680" alt="Intel Core i7-8086K Virtualized Guest Exact String Performance">
       <br><em>Figure 4: Virtualized Guest (VMware on Intel Core i7-8086K)</em>
     </td>
   </tr>
 </table>
 
-For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 512-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both mobile and desktop architectures to sustain flat baseline performance (exceeding 10.6M ops/sec for `WCHAR` and up to 18.8M ops/sec for `CHAR`) without degradation from 10 to 10,000 registered patterns.
+For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 1024-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both mobile and desktop architectures to sustain flat baseline performance (exceeding 10.6M ops/sec for `WCHAR` and up to 18.8M ops/sec for `CHAR`) without degradation from 10 to 10,000 registered patterns.
 
 > **See Also:** For details on the isolated performance behavior of the underlying data structures, refer to the `/TestContainer/` description in the [Project Layout](#project-layout).
 ---
