@@ -316,11 +316,11 @@ Evaluating realistic paths requires an initial prefix hash lookup followed by a 
 <table border="0" cellspacing="0" cellpadding="0">
   <tr>
     <td align="center" valign="middle" width="50%">
-      <img src="assets/exact_string_scaling_1165G7.png" width="680" alt="Intel Core i7-1165G7 Exact String Scaling Performance">
+      <img src="Assets/exact_string_scaling_1165G7.png" width="680" alt="Intel Core i7-1165G7 Exact String Scaling Performance">
       <br><em>Figure 3: Bare-Metal (Intel Core i7-1165G7)</em>
     </td>
     <td align="center" valign="middle" width="50%">
-      <img src="assets/exact_string_scaling_8086K.png" width="680" alt="Intel Core i7-8086K Virtualized Guest Exact String Performance">
+      <img src="Assets/exact_string_scaling_8086K.png" width="680" alt="Intel Core i7-8086K Virtualized Guest Exact String Performance">
       <br><em>Figure 4: Virtualized Guest (VMware on Intel Core i7-8086K)</em>
     </td>
   </tr>
