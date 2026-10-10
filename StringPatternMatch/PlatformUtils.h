@@ -253,5 +253,12 @@ namespace kstd
     //--------------------------------------------------------------------------------
     template <typename T>
     inline constexpr bool has_unique_object_representations_v = __has_unique_object_representations(T);
+
+    //--------------------------------------------------------------------------------
+    // Tag dispatch structures for standard iterator categorization.
+    // Identifies the iterator's traversal capabilities for generic algorithms.
+    //--------------------------------------------------------------------------------
+    struct input_iterator_tag {};
+    struct forward_iterator_tag : input_iterator_tag {};
 }
 #endif

@@ -40,9 +40,8 @@ struct KDefaultHash
     // Return:
     //   The mixed 64-bit value ensuring uniform bit distribution.
     //--------------------------------------------------------------------------------
-    static inline UINT64 Mix64(_In_ UINT64 Val) noexcept
-    {
-        // Adding the odd golden-ratio constant guarantees a 1-to-1 bijection and non-zero zero mapping.
+    static __forceinline UINT64 Mix64(_In_ UINT64 Val) noexcept
+    {        
         UINT64 z = Val + 0x9E3779B97F4A7C15ULL;
         z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
@@ -63,7 +62,7 @@ struct KDefaultHash
     {
         if constexpr (sizeof(T) == 8)
         {
-            // Scalar path for 64-bit integers, pointers, handles, and 8-byte structures.            
+            // Scalar path for 64-bit integers, pointers, handles, and 8-byte structures.
             UINT64 val;
             RtlCopyMemory(&val, &Key, sizeof(UINT64));
             return static_cast<SIZE_T>(Mix64(val));
@@ -91,42 +90,157 @@ struct KDefaultHash
         }
         else if constexpr (sizeof(T) == 16)
         {
-            // Branchless fast path for 128-bit types (GUID, LUID pairs, IPv6 addresses).
-            // Asymmetric mixing prevents commutativity (k1 ^ k2 != k2 ^ k1).
             UINT64 p64[2];
             RtlCopyMemory(p64, &Key, sizeof(p64));
-            return static_cast<SIZE_T>(Mix64(p64[0] ^ Mix64(p64[1])));
+
+            // Asymmetric primes to break commutativity (preventing [A, B] from hashing same as [B, A])
+            constexpr UINT64 c1 = 0x9E3779B97F4A7C15ULL; 
+            constexpr UINT64 c2 = 0xBF58476D1CE4E5B9ULL; 
+
+            UINT64 a = p64[0] ^ c1;
+            UINT64 b = p64[1] ^ c2;
+
+            UINT64 low, high;
+    
+        #if defined(_M_X64)
+            low = _umul128(a, b, &high);
+        #elif defined(_M_ARM64)
+            low = a * b;
+            high = __umulh(a, b);
+        #else
+            #error "KDefaultHash 16-byte fast path requires a 64-bit architecture (x64 or ARM64)."
+        #endif
+
+            // Fold the 128-bit product back into 64 bits ensuring high bits influence the lower index
+            return static_cast<SIZE_T>(low ^ high);
         }
         else
         {
-            // High-speed SWAR 64-bit block chunking for arbitrary structs and memory buffers.
-            static_assert(kstd::has_unique_object_representations_v<T>, 
-                "KDefaultHash generic struct fallback requires types without uninitialized compiler padding to prevent hash entropy leaks.");
-            
+            static_assert(kstd::has_unique_object_representations_v<T>,
+                "KDefaultHash generic fallback requires types without padding to prevent entropy leaks.");
+
             const unsigned char* p = reinterpret_cast<const unsigned char*>(&Key);
-            UINT64 hash = 0xCBF29CE484222325ULL ^ (static_cast<UINT64>(sizeof(T)) * 0x9E3779B97F4A7C15ULL);
-            SIZE_T i = 0;
 
-            for (; i + 8 <= sizeof(T); i += 8)
+            // ------------------------------------------------------------------------
+            // Small Odd-Sizes (3, 5-7, 9-15 bytes) -> Overlapping Branchless Reads
+            // ------------------------------------------------------------------------
+            if constexpr (sizeof(T) < 16)
             {
-                UINT64 chunk;
-                RtlCopyMemory(&chunk, p + i, sizeof(UINT64));
-                hash = (hash ^ chunk) * 0x100000001B3ULL;
-                hash ^= (hash >> 31);
-            }
+                UINT64 a = 0, b = 0;
 
-            if constexpr ((sizeof(T) & 7) != 0)
-            {
-                UINT64 tail = 0;
-                for (SIZE_T j = i; j < sizeof(T); ++j)
+                // Exact size known at compile time; compiler extracts only the active branch
+                if constexpr (sizeof(T) >= 9)
                 {
-                    tail |= static_cast<UINT64>(p[j]) << ((j - i) * 8);
+                    RtlCopyMemory(&a, p, 8);
+                    RtlCopyMemory(&b, p + sizeof(T) - 8, 8); // Overlapping 8-byte read
                 }
-                hash = (hash ^ tail) * 0x100000001B3ULL;
-            }
+                else if constexpr (sizeof(T) >= 5)
+                {
+                    UINT32 low, high;
+                    RtlCopyMemory(&low, p, 4);
+                    RtlCopyMemory(&high, p + sizeof(T) - 4, 4); // Overlapping 4-byte read
+                    a = low; 
+                    b = high;
+                }
+                else // sizeof(T) == 3
+                {
+                    UINT16 low, high;
+                    RtlCopyMemory(&low, p, 2);
+                    RtlCopyMemory(&high, p + sizeof(T) - 2, 2); // Overlapping 2-byte read
+                    a = low; 
+                    b = high;
+                }
 
-            // Final avalanche step guarantees uniform bit distribution across all 64 bits.
-            return static_cast<SIZE_T>(Mix64(hash));
+                a ^= 0x9E3779B97F4A7C15ULL;
+                b ^= 0xBF58476D1CE4E5B9ULL;
+
+                UINT64 lowRes, highRes;
+            #if defined(_M_X64)
+                lowRes = _umul128(a, b, &highRes);
+            #elif defined(_M_ARM64)
+                lowRes = a * b;
+                highRes = __umulh(a, b);
+            #endif
+                // Incorporate struct size into the final mix to prevent cross-size collisions
+                return static_cast<SIZE_T>(Mix64(lowRes ^ highRes ^ sizeof(T)));
+            }
+            // ------------------------------------------------------------------------
+            // Large Structs (> 16 bytes) -> 32-Byte ILP Chunking + Overlapping Tail
+            // ------------------------------------------------------------------------
+            else
+            {
+                UINT64 seed1 = 0xCBF29CE484222325ULL ^ (static_cast<UINT64>(sizeof(T)) * 0x9E3779B97F4A7C15ULL);
+                UINT64 seed2 = 0xBF58476D1CE4E5B9ULL;
+
+                SIZE_T i = 0;
+
+                // Dual-state loop allows out-of-order execution engines to run L1 and L2 concurrently
+                for (; i + 32 <= sizeof(T); i += 32)
+                {
+                    UINT64 a1, b1, a2, b2;
+                    RtlCopyMemory(&a1, p + i, 8);
+                    RtlCopyMemory(&b1, p + i + 8, 8);
+                    RtlCopyMemory(&a2, p + i + 16, 8);
+                    RtlCopyMemory(&b2, p + i + 24, 8);
+
+                    a1 ^= seed1;
+                    b1 ^= 0x9E3779B97F4A7C15ULL;
+                    a2 ^= seed2;
+                    b2 ^= 0xBF58476D1CE4E5B9ULL;
+
+                    UINT64 L1, H1, L2, H2;
+                #if defined(_M_X64)
+                    L1 = _umul128(a1, b1, &H1);
+                    L2 = _umul128(a2, b2, &H2);
+                #elif defined(_M_ARM64)
+                    L1 = a1 * b1; H1 = __umulh(a1, b1);
+                    L2 = a2 * b2; H2 = __umulh(a2, b2);
+                #endif
+                    seed1 = L1 ^ H1;
+                    seed2 = L2 ^ H2;
+                }
+
+                if constexpr ((sizeof(T) % 32) >= 16)
+                {
+                    UINT64 a, b;
+                    RtlCopyMemory(&a, p + i, 8);
+                    RtlCopyMemory(&b, p + i + 8, 8);
+
+                    a ^= seed1;
+                    b ^= 0x9E3779B97F4A7C15ULL;
+
+                    UINT64 L, H;
+                #if defined(_M_X64)
+                    L = _umul128(a, b, &H);
+                #elif defined(_M_ARM64)
+                    L = a * b; 
+                    H = __umulh(a, b);
+                #endif
+                    seed1 = L ^ H;
+                }
+
+                // Branchless Overlapping Tail: Hash the absolute LAST 16 bytes of the struct.
+                if constexpr ((sizeof(T) % 16) != 0)
+                {
+                    UINT64 a, b;
+                    RtlCopyMemory(&a, p + sizeof(T) - 16, 8);
+                    RtlCopyMemory(&b, p + sizeof(T) - 8, 8);
+
+                    a ^= seed1;
+                    b ^= seed2;
+
+                    UINT64 L, H;
+                #if defined(_M_X64)
+                    L = _umul128(a, b, &H);
+                #elif defined(_M_ARM64)
+                    L = a * b; 
+                    H = __umulh(a, b);
+                #endif
+                    seed1 = L ^ H;
+                }
+
+                return static_cast<SIZE_T>(Mix64(seed1 ^ seed2));
+            }
         }
     }
 };
@@ -246,12 +360,34 @@ private:
     // Return:
     //   A 64-bit bitmask where matched byte locations have their MSB set to 1.
     //--------------------------------------------------------------------------------
-    static inline UINT64 SwarMatch(_In_ UINT64 Block, 
-                                   _In_ UCHAR  MatchByte) noexcept
+    static __forceinline UINT64 SwarMatch(_In_ UINT64 Block, 
+                                          _In_ UCHAR  MatchByte) noexcept
     {
         const UINT64 xorBlock = Block ^ (0x0101010101010101ULL * MatchByte);
         return (xorBlock - 0x0101010101010101ULL) & ~xorBlock & 0x8080808080808080ULL;
     }
+
+    //--------------------------------------------------------------------------------
+    // Traits mapping boolean constness to the appropriate internal pointer types.
+    //--------------------------------------------------------------------------------
+    template <bool IsConst>
+    struct IterTraits;
+
+    template <>
+    struct IterTraits<false>
+    {
+        using CtrlPtr = UCHAR*;
+        using SlotPtr = Slot*;
+        using SlotRef = Slot&;
+    };
+
+    template <>
+    struct IterTraits<true>
+    {
+        using CtrlPtr = const UCHAR*;
+        using SlotPtr = const Slot*;
+        using SlotRef = const Slot&;
+    };
 
 public:    
     //--------------------------------------------------------------------------------
@@ -450,7 +586,7 @@ public:
     }
 
     //--------------------------------------------------------------------------------
-    // Looks up a key and returns a pointer to its value if found.
+    // Looks up a key and returns a pointer to its mutable value if found.
     //
     // Parameters:
     //   Key - Target key structure evaluated via SWAR hashing protocol.
@@ -458,53 +594,34 @@ public:
     // Return:
     //   Pointer to the mapped item, or nullptr if the element is absent.
     //--------------------------------------------------------------------------------
-    V* Find(_In_ const K& Key) const noexcept
+    V* Find(_In_ const K& Key) noexcept
     {
-        // Bypass map hashing entirely if there are currently no active elements
-        if (m_Size == 0) [[unlikely]]
+        const SIZE_T idx = FindIndexInternal(Key);
+
+        if (idx != m_Capacity) [[likely]]
         {
-            return nullptr;
+            return &m_Slots[idx].Value;
         }
 
-        const SIZE_T hash  = Hash{}(Key);        
-        SIZE_T       index = (hash & (m_Capacity - 1)) & ~(kGroupSize - 1);
-        const SIZE_T start = index;
-        const UCHAR  h2    = static_cast<UCHAR>(hash >> 57) & 0x7F;
+        return nullptr;
+    }
 
-        while (true)
-        {            
-            const UINT64 ctrlBlock = *reinterpret_cast<const __unaligned UINT64*>(&m_Ctrl[index]);
-            UINT64 match = SwarMatch(ctrlBlock, h2);
-            
-            while (match != 0)
-            {
-                unsigned long bitPos;
-                _BitScanForward64(&bitPos, match);
-                
-                const SIZE_T realIdx = index + (bitPos / 8);
+    //--------------------------------------------------------------------------------
+    // Looks up a key and returns a pointer to its constant value if found.
+    //
+    // Parameters:
+    //   Key - Target key structure evaluated via SWAR hashing protocol.
+    //
+    // Return:
+    //   Pointer to the mapped item, or nullptr if the element is absent.
+    //--------------------------------------------------------------------------------
+    const V* Find(_In_ const K& Key) const noexcept
+    {
+        const SIZE_T idx = FindIndexInternal(Key);
 
-                if (m_Slots[realIdx].Key == Key) [[likely]]
-                {
-                    return &m_Slots[realIdx].Value;
-                }
-                
-                match &= match - 1;
-            }
-
-            // High-speed empty block detection: 
-            // Valid h2 metadata bytes are strictly 7-bit (MSB = 0).
-            // Empty control bytes (0xFF) are the only bytes with the MSB set.
-            if ((ctrlBlock & 0x8080808080808080ULL) != 0) [[likely]]
-            {
-                return nullptr;
-            }
-
-            index = (index + kGroupSize) & (m_Capacity - 1);
-            
-            if (index == start) [[unlikely]]
-            {
-                break;
-            }
+        if (idx != m_Capacity) [[likely]]
+        {
+            return &m_Slots[idx].Value;
         }
 
         return nullptr;
@@ -533,13 +650,29 @@ public:
     }
 
     //--------------------------------------------------------------------------------
-    // Iterator provides forward-traversal capabilities across the hash map.
+    // BaseIterator acts as a unified template for both mutable and const iterators.
     // It utilizes the control byte array to efficiently skip empty indices 
     // without inspecting the underlying Key/Value slots.
     //--------------------------------------------------------------------------------
-    class Iterator
+    template <bool IsConst>
+    class BaseIterator
     {
+        friend class KFlatHashMap;
+        
+        // Grant mutual friendship to allow the const iterator to read the non-const iterator's pointers
+        template <bool> friend class BaseIterator; 
     public:
+        using CtrlPtr = typename IterTraits<IsConst>::CtrlPtr;
+        using SlotPtr = typename IterTraits<IsConst>::SlotPtr;
+        using SlotRef = typename IterTraits<IsConst>::SlotRef;
+
+        // Standard C++ iterator trait aliases for template metaprogramming
+        using iterator_category = kstd::forward_iterator_tag; 
+        using value_type        = Slot;
+        using difference_type   = INT_PTR;
+        using pointer           = SlotPtr;
+        using reference         = SlotRef;
+
         //--------------------------------------------------------------------------------
         // Initializes the iterator and automatically advances to the first occupied 
         // slot in the map.
@@ -550,19 +683,36 @@ public:
         //   Capacity - Upper limit array constraint protecting evaluation overruns.
         //   Index    - Starting location scalar.
         //--------------------------------------------------------------------------------
-        Iterator(_In_ UCHAR* pCtrl, 
-                 _In_ Slot*  pSlots, 
-                 _In_ SIZE_T Capacity, 
-                 _In_ SIZE_T Index) : m_Ctrl(pCtrl), 
-                                      m_Slots(pSlots), 
-                                      m_Capacity(Capacity), 
-                                      m_Index(Index) 
+        BaseIterator(_In_ CtrlPtr pCtrl, 
+                     _In_ SlotPtr pSlots, 
+                     _In_ SIZE_T  Capacity, 
+                     _In_ SIZE_T  Index) : m_Ctrl(pCtrl), 
+                                           m_Slots(pSlots), 
+                                           m_Capacity(Capacity), 
+                                           m_Index(Index) 
         { 
             AdvanceToOccupied(); 
         }
 
+        BaseIterator(const BaseIterator&) = default;
+        BaseIterator& operator=(const BaseIterator&) = default;
+
+        //--------------------------------------------------------------------------------
+        // Conversion constructor allowing implicit promotion from Iterator to ConstIterator.
+        // Const-correctness is inherently enforced: attempting to construct a non-const 
+        // Iterator from a ConstIterator will fail to compile as UCHAR* cannot bind to const UCHAR*.
+        //--------------------------------------------------------------------------------
+        template <bool OtherConst>
+        BaseIterator(const BaseIterator<OtherConst>& Other) : m_Ctrl(Other.m_Ctrl), 
+                                                              m_Slots(Other.m_Slots), 
+                                                              m_Capacity(Other.m_Capacity), 
+                                                              m_Index(Other.m_Index) 
+        {
+        }
+
         //--------------------------------------------------------------------------------
         // Evaluates inequality between two iterators based on their current index.
+        // Permits direct comparisons between Iterators and ConstIterators.
         //
         // Parameters:
         //   Other - Object against which inequality comparison occurs.
@@ -570,9 +720,26 @@ public:
         // Return:
         //   True if object indices are unequal, false otherwise.
         //--------------------------------------------------------------------------------
-        bool operator!=(const Iterator& Other) const 
+        template <bool OtherConst>
+        bool operator!=(const BaseIterator<OtherConst>& Other) const 
         { 
             return m_Index != Other.m_Index; 
+        }
+
+        //--------------------------------------------------------------------------------
+        // Evaluates equality between two iterators based on their current index.
+        // Permits direct comparisons between Iterators and ConstIterators.
+        //
+        // Parameters:
+        //   Other - Object against which equality comparison occurs.
+        //
+        // Return:
+        //   True if object indices are equal, false otherwise.
+        //--------------------------------------------------------------------------------
+        template <bool OtherConst>
+        bool operator==(const BaseIterator<OtherConst>& Other) const 
+        { 
+            return m_Index == Other.m_Index; 
         }
         
         //--------------------------------------------------------------------------------
@@ -582,20 +749,34 @@ public:
         // Return:
         //   A reference to the incremented operator element.
         //--------------------------------------------------------------------------------
-        Iterator& operator++() 
+        BaseIterator& operator++() 
         { 
             m_Index++; 
             AdvanceToOccupied(); 
             return *this; 
+        }
+
+        //--------------------------------------------------------------------------------
+        // Post-increments the iterator, advancing past empty entries to the next valid 
+        // element, while returning a copy of the original iterator state.
+        //
+        // Return:
+        //   A copy of the iterator prior to incrementing.
+        //--------------------------------------------------------------------------------
+        BaseIterator operator++(int) 
+        { 
+            BaseIterator temp = *this; 
+            ++(*this); // Offload logic to the pre-increment operator
+            return temp; 
         }
         
         //--------------------------------------------------------------------------------
         // Dereferences the iterator to provide a direct reference to the Key/Value slot.
         //
         // Return:
-        //   Mutable underlying reference.
+        //   Underlying reference (mutable or const depending on instantiation).
         //--------------------------------------------------------------------------------
-        Slot& operator*()  
+        SlotRef operator*() const  
         { 
             return m_Slots[m_Index]; 
         }
@@ -604,9 +785,9 @@ public:
         // Accesses the Key or Value properties of the currently pointed-to slot.
         //
         // Return:
-        //   Mutable underlying address.
+        //   Underlying address (mutable or const depending on instantiation).
         //--------------------------------------------------------------------------------
-        Slot* operator->() 
+        SlotPtr operator->() const 
         { 
             return &m_Slots[m_Index]; 
         }
@@ -614,7 +795,8 @@ public:
     private:
         //--------------------------------------------------------------------------------
         // Linearly scans the control array until a valid (non-empty) control byte is 
-        // found, or the end of capacity is reached.
+        // found, or the end of capacity is reached. Append-only logic relies safely 
+        // on checking strictly for kEmptyCtrl.
         //--------------------------------------------------------------------------------
         void AdvanceToOccupied()
         {
@@ -624,11 +806,14 @@ public:
             }
         }
         
-        UCHAR* m_Ctrl;     // Pointer to the parent map's control byte array.                
-        Slot*  m_Slots;    // Pointer to the parent map's key-value slots.                
-        SIZE_T m_Capacity; // The total allocated capacity of the map.                
-        SIZE_T m_Index;    // The current cursor index representing the iterator's position.
+        CtrlPtr m_Ctrl;     // Pointer to the parent map's control byte array.                
+        SlotPtr m_Slots;    // Pointer to the parent map's key-value slots.                 
+        SIZE_T  m_Capacity; // The total allocated capacity of the map.                 
+        SIZE_T  m_Index;    // The current cursor index representing the iterator's position.
     };
+
+    using Iterator      = BaseIterator<false>;
+    using ConstIterator = BaseIterator<true>;
 
     //--------------------------------------------------------------------------------
     // Generates an Iterator at the start of the populated dataset block map.
@@ -652,7 +837,92 @@ public:
         return Iterator(m_Ctrl, m_Slots, m_Capacity, m_Capacity); 
     }
 
+    //--------------------------------------------------------------------------------
+    // Map traversal boundary accessors for const-qualified maps.
+    //--------------------------------------------------------------------------------
+    ConstIterator begin() const  
+    { 
+        return ConstIterator(m_Ctrl, m_Slots, m_Capacity, 0); 
+    }
+    
+    ConstIterator end() const    
+    { 
+        return ConstIterator(m_Ctrl, m_Slots, m_Capacity, m_Capacity); 
+    }
+    
+    ConstIterator cbegin() const 
+    { 
+        return begin(); 
+    }
+    
+    ConstIterator cend() const   
+    { 
+        return end(); 
+    }
+
 private:
+
+    //--------------------------------------------------------------------------------
+    // Internal helper to locate the absolute index of a key.
+    // Unifies the probing logic for Find() and Find() const operations.
+    //
+    // Parameters:
+    //   Key - Target key structure to locate.
+    //
+    // Return:
+    //   The absolute index in the slot array, or m_Capacity if not found.
+    //--------------------------------------------------------------------------------
+    __forceinline SIZE_T FindIndexInternal(_In_ const K& Key) const noexcept
+    {
+        // Bypass map hashing entirely if there are currently no active elements
+        if (m_Size == 0) [[unlikely]]
+        {
+            return m_Capacity;
+        }
+
+        const SIZE_T hash  = Hash{}(Key);        
+        SIZE_T       index = (hash & (m_Capacity - 1)) & ~(kGroupSize - 1);
+        const SIZE_T start = index;
+        const UCHAR  h2    = static_cast<UCHAR>(hash >> 57) & 0x7F;
+
+        while (true)
+        {            
+            const UINT64 ctrlBlock = *reinterpret_cast<const __unaligned UINT64*>(&m_Ctrl[index]);
+            UINT64 match = SwarMatch(ctrlBlock, h2);
+            
+            while (match != 0)
+            {
+                unsigned long bitPos;
+                _BitScanForward64(&bitPos, match);
+                
+                const SIZE_T realIdx = index + (bitPos / 8);
+
+                if (m_Slots[realIdx].Key == Key) [[likely]]
+                {
+                    return realIdx;
+                }
+                
+                match &= match - 1;
+            }
+
+            // High-speed empty block detection: 
+            // Valid h2 metadata bytes are strictly 7-bit (MSB = 0).
+            // Empty control bytes (0xFF) are the only bytes with the MSB set.
+            if ((ctrlBlock & 0x8080808080808080ULL) != 0) [[likely]]
+            {
+                return m_Capacity;
+            }
+
+            index = (index + kGroupSize) & (m_Capacity - 1);
+            
+            if (index == start) [[unlikely]]
+            {
+                break;
+            }
+        }
+
+        return m_Capacity;
+    }
 
     //--------------------------------------------------------------------------------
     // Expands and reorganizes internal memory capacity, migrating items to new slots.

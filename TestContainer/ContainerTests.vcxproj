@@ -227,6 +227,7 @@
     <ClInclude Include="..\StringPatternMatch\KDeque.h" />
     <ClInclude Include="..\StringPatternMatch\KHashMap.h" />
     <ClInclude Include="..\StringPatternMatch\KVector.h" />
+    <ClInclude Include="..\StringPatternMatch\PlatformUtils.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
