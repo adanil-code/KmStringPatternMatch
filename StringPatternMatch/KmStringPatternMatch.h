@@ -49,6 +49,8 @@
 template <typename TChar = WCHAR, POOL_FLAGS PoolType = POOL_FLAG_NON_PAGED, ULONG PoolTag = 'arSK'>
 class KStringArena
 {
+    static_assert(sizeof(TChar) == 1 || sizeof(TChar) == 2, "KStringArena only supports 8-bit CHAR and 16-bit WCHAR types.");
+
 public:
     // Bookmark structure to support atomic memory transactions
     struct Bookmark
@@ -79,6 +81,9 @@ public:
     {
     }
 
+    KStringArena(const KStringArena&)            = delete;
+    KStringArena& operator=(const KStringArena&) = delete;
+
     // -------------------------------------------------------------------------------------------
     // Destructor ensuring all chained memory slabs are released.
     // -------------------------------------------------------------------------------------------
@@ -98,15 +103,16 @@ public:
     // -------------------------------------------------------------------------------------------
     TChar* Allocate(_In_ SIZE_T Length) noexcept
     {
-        if (Length == 0) [[unlikely]]
+        // Data-Oriented Arena Alignment: Ensure all carved buffers are aligned to 8 bytes 
+        // to natively support fast SWAR block comparisons without hardware traps.
+        constexpr SIZE_T charAlign = 8 / sizeof(TChar);
+
+        if (Length == 0 || Length > (MAXULONG_PTR - FIELD_OFFSET(Slab, Buffer) - charAlign) / sizeof(TChar)) [[unlikely]]
         {
             return nullptr;
         }
 
-        // Data-Oriented Arena Alignment: Ensure all carved buffers are aligned to 8 bytes 
-        // to natively support fast SWAR block comparisons without hardware traps.
-        constexpr SIZE_T charAlign     = 8 / sizeof(TChar);
-        SIZE_T           alignedLength = (Length + (charAlign - 1)) & ~(charAlign - 1);
+        SIZE_T alignedLength = (Length + (charAlign - 1)) & ~(charAlign - 1);
 
         if (m_Tail == nullptr || (m_Tail->Capacity - m_Tail->Used) < alignedLength)
         {
@@ -305,7 +311,7 @@ namespace KmStringPatternMatchDetail
         }
         else
         {
-            return static_cast<UINT64>(c);
+            return static_cast<UINT64>(static_cast<UINT16>(c));
         }
     }
 
@@ -332,7 +338,7 @@ namespace KmStringPatternMatchDetail
         else
         {
             // Fast-path inline ASCII check for 16-bit WCHAR
-            if (c <= 127)
+            if (static_cast<UINT16>(c) <= 127)
             {
                 return c - ((c >= L'a' && c <= L'z') << 5);
             }
@@ -476,6 +482,8 @@ namespace KmStringPatternMatchDetail
 template <typename TContext, typename TChar = WCHAR, POOL_FLAGS PoolType = POOL_FLAG_NON_PAGED>
 class KmStringPatternMatch
 {
+    static_assert(sizeof(TChar) == 1 || sizeof(TChar) == 2, "KmStringPatternMatch only supports 8-bit CHAR and 16-bit WCHAR types.");
+
 private:
     // Represents a slice of literal or wildcard text mapped in the pattern arena.
     struct PatternString
@@ -492,7 +500,7 @@ private:
         PatternString    TailAnchor;             // Anchored trailing literal segment (if any)
         UINT32           Id;                     // Unique incremental identifier for this pattern record
         UINT32           ContextIndex;           // Offset index pointing to the user payload in m_ContextArena
-        UINT16           MinWildcardMatchLength; // Minimum required character length for the wildcard suffix
+        UINT32           MinWildcardMatchLength; // Minimum required character length for the wildcard suffix
         WILD_CARD_SCOPE  Scope;                  // Wildcard traversal scope boundary (e.g., SCOPE_PATH_SEGMENT)
         TChar            FirstLiteralChar;       // Fast-filter anchor character for slow-path evaluation paths
     };
@@ -508,6 +516,9 @@ public:
     //   bCaseInsensitive - True to evaluate strings without case sensitivity, false for exact match.
     // -------------------------------------------------------------------------------------------
     KmStringPatternMatch(_In_ bool bCaseInsensitive = false) noexcept;
+
+    KmStringPatternMatch(const KmStringPatternMatch&)            = delete;
+    KmStringPatternMatch& operator=(const KmStringPatternMatch&) = delete;
     
     // -------------------------------------------------------------------------------------------
     // Destroys the pattern matcher, freeing all internal resources.
@@ -733,8 +744,8 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
                                                                      _In_                   WILD_CARD_SCOPE         WildScope,
                                                                      _Inout_                TContext&&              PatternContext)
 {
-    // Guard against integer overflow triggering kernel pool corruption during arena buffer allocation
-    if (cchPattern > (MAXULONG_PTR - 4096) / sizeof(TChar)) [[unlikely]]
+    // Guard against null pattern buffer with non-zero length or integer overflow during arena allocation
+    if ((sPattern == nullptr && cchPattern > 0) || cchPattern > (MAXULONG_PTR - 4096) / sizeof(TChar)) [[unlikely]]
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -856,8 +867,8 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
     }
 
     // Tail Anchoring: Parse forward to safely extract the trailing literal segment after the final wildcard
-    UINT32 lastWildcardEnd = 0;
-    const TChar* pWildSuffix = (cchWildPart > 0) ? (pStableBuffer + prefixUnescapedLen) : nullptr;
+    UINT32       lastWildcardEnd = 0;
+    const TChar* pWildSuffix     = (cchWildPart > 0) ? (pStableBuffer + prefixUnescapedLen) : nullptr;
 
     for (UINT32 i = 0; i < cchWildPart; ++i)
     {
@@ -878,7 +889,7 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
         }
     }
 
-    UINT32 tailStart = lastWildcardEnd;
+    UINT32 tailStart        = lastWildcardEnd;
     UINT32 tailUnescapedLen = 0;
 
     for (UINT32 i = tailStart; i < cchWildPart; ++i)
@@ -943,23 +954,19 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
     newEntry.LiteralPrefix.Length   = prefixUnescapedLen;
     newEntry.TailAnchor.Buffer      = pTailBuffer;
     newEntry.TailAnchor.Length      = tailUnescapedLen;
-    newEntry.Id                     = ++m_nPatternCount;
+    newEntry.Id                     = m_nPatternCount + 1;
     newEntry.ContextIndex           = ctxIndex;
-    newEntry.MinWildcardMatchLength = static_cast<UINT16>(suffixMinLength);
+    newEntry.MinWildcardMatchLength = suffixMinLength;
     newEntry.Scope                  = WildScope;
     newEntry.FirstLiteralChar       = 0;
 
     UINT32 requiredLength = prefixUnescapedLen + suffixMinLength;
-    if (requiredLength < m_nGlobalMinMatchLength)
-    {
-        m_nGlobalMinMatchLength = requiredLength;
-    }
 
     if (cchWildPart != 0)
     {
+        // Trim WildcardSuffix to lastWildcardEnd so WildCardMatch does not re-evaluate TailAnchor
         newEntry.WildcardSuffix.Buffer = pStableBuffer + prefixUnescapedLen;
-        newEntry.WildcardSuffix.Length = cchWildPart;
-        m_bWildCardPresent             = true;
+        newEntry.WildcardSuffix.Length = lastWildcardEnd;
     }
     else
     {
@@ -968,31 +975,53 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
     }
 
     // Isolate patterns beginning immediately with a wildcard to prevent hash map collisions 
-    if (prefixUnescapedLen == 0)
+    if (prefixUnescapedLen == 0 && cchWildPart > 0)
     {
-        for (UINT32 i = 0; i < cchWildPart; i++)
+        // Populate FirstLiteralChar only when both '*' and '?' precede the first literal character;
+        // patterns starting with '*<literal>' fast-forward directly in WildCardMatch, and '?<literal>' resolves in O(1).
+        bool bSeenStar     = false;
+        bool bSeenQuestion = false;
+
+        for (UINT32 i = 0; i < lastWildcardEnd; i++)
         {
             TChar c = newEntry.WildcardSuffix.Buffer[i];
             
             // Advance cache if the character is an explicitly escaped wildcard operator
-            if (c == kEscape && i + 1 < cchWildPart) [[unlikely]]
+            if (c == kEscape && i + 1 < lastWildcardEnd) [[unlikely]]
             {
                 TChar nextChar = newEntry.WildcardSuffix.Buffer[i + 1];
 
                 if (nextChar == kStar || nextChar == kQuestion || nextChar == kEscape)
                 {
-                    newEntry.FirstLiteralChar = nextChar;
+                    if (bSeenStar && bSeenQuestion)
+                    {
+                        newEntry.FirstLiteralChar = nextChar;
+                    }
                     break;
                 }
                 else
                 {
-                    newEntry.FirstLiteralChar = c;
+                    if (bSeenStar && bSeenQuestion)
+                    {
+                        newEntry.FirstLiteralChar = c;
+                    }
                     break;
                 }
             }
-            else if (c != kStar && c != kQuestion)
+            else if (c == kStar)
             {
-                newEntry.FirstLiteralChar = c;
+                bSeenStar = true;
+            }
+            else if (c == kQuestion)
+            {
+                bSeenQuestion = true;
+            }
+            else
+            {
+                if (bSeenStar && bSeenQuestion)
+                {
+                    newEntry.FirstLiteralChar = c;
+                }
                 break;
             }
         }
@@ -1004,6 +1033,13 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
             return status;
         }
         
+        ++m_nPatternCount;
+        m_bWildCardPresent = true;
+        if (requiredLength < m_nGlobalMinMatchLength)
+        {
+            m_nGlobalMinMatchLength = requiredLength;
+        }
+
         return STATUS_SUCCESS;
     }
 
@@ -1043,6 +1079,16 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
     {
         m_StringArena.RevertBookmark(bookmark);
         return status;
+    }
+
+    ++m_nPatternCount;
+    if (cchWildPart != 0)
+    {
+        m_bWildCardPresent = true;
+    }
+    if (requiredLength < m_nGlobalMinMatchLength)
+    {
+        m_nGlobalMinMatchLength = requiredLength;
     }
 
     // Distribute bits via shifted segment map across the 1024-bit array
@@ -1090,7 +1136,17 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::Search(_In_reads_(cchText)
                                                              _In_                      UINT32                  cchText,
                                                              _Outptr_result_maybenull_ TContext**              PatternContext) const noexcept
 {
+    if (PatternContext == nullptr) [[unlikely]]
+    {
+        return false;
+    }
+
     *PatternContext = nullptr;
+
+    if (sText == nullptr && cchText > 0) [[unlikely]]
+    {
+        return false;
+    }
 
     auto collector = [&](const TContext* pContext) -> bool
     {
@@ -1125,6 +1181,11 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::Search(_In_reads_(cchT
                                                                  _Out_               KVector<TContext*, PoolType>&       PatternContexts) const noexcept
 {
     PatternContexts.Clear();
+
+    if (sText == nullptr && cchText > 0) [[unlikely]]
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     NTSTATUS outStatus = STATUS_SUCCESS;
 
@@ -1424,6 +1485,9 @@ inline bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePatternSuff
                                                                                    _In_reads_(cchText) const TChar* __restrict sText, 
                                                                                    _In_                UINT32                  cchText) const noexcept
 {
+    UINT32 cchWildText = cchText - pattern.TailAnchor.Length;
+    UINT32 minWildLen  = pattern.MinWildcardMatchLength - pattern.TailAnchor.Length;
+
     if constexpr (IsCaseInsensitive)
     {
         if (pattern.Scope == SCOPE_PATH_SEGMENT)
@@ -1431,16 +1495,16 @@ inline bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePatternSuff
             return WildCardMatch<true, true>(pattern.WildcardSuffix.Buffer,
                                              pattern.WildcardSuffix.Length,
                                              sText,
-                                             cchText,
-                                             pattern.MinWildcardMatchLength);
+                                             cchWildText,
+                                             minWildLen);
         }
         else
         {
             return WildCardMatch<true, false>(pattern.WildcardSuffix.Buffer,
                                               pattern.WildcardSuffix.Length,
                                               sText,
-                                              cchText,
-                                              pattern.MinWildcardMatchLength);
+                                              cchWildText,
+                                              minWildLen);
         }
     }
     else
@@ -1450,16 +1514,16 @@ inline bool KmStringPatternMatch<TContext, TChar, PoolType>::EvaluatePatternSuff
             return WildCardMatch<false, true>(pattern.WildcardSuffix.Buffer,
                                               pattern.WildcardSuffix.Length,
                                               sText,
-                                              cchText,
-                                              pattern.MinWildcardMatchLength);
+                                              cchWildText,
+                                              minWildLen);
         }
         else
         {
             return WildCardMatch<false, false>(pattern.WildcardSuffix.Buffer,
                                                pattern.WildcardSuffix.Length,
                                                sText,
-                                               cchText,
-                                               pattern.MinWildcardMatchLength);
+                                               cchWildText,
+                                               minWildLen);
         }
     }
 }
@@ -1495,12 +1559,18 @@ inline bool KmStringPatternMatch<TContext, TChar, PoolType>::ProcessSlowPath(_In
             continue;
         }
 
+        if (!EvaluateTailMatch<IsCaseInsensitive>(pattern, sText, cchText))
+        {
+            continue;
+        }
+
         // FirstLiteralChar Optimization: O(N) early rejection before state machine evaluation
         if (pattern.FirstLiteralChar != 0)
         {
-            bool bFound = false;
+            bool   bFound     = false;
+            UINT32 searchStop = cchText - pattern.TailAnchor.Length;
             
-            for (UINT32 i = 0; i < cchText; ++i)
+            for (UINT32 i = 0; i < searchStop; ++i)
             {
                 if constexpr (IsCaseInsensitive)
                 {
@@ -1524,11 +1594,6 @@ inline bool KmStringPatternMatch<TContext, TChar, PoolType>::ProcessSlowPath(_In
             {
                 continue;
             }
-        }
-
-        if (!EvaluateTailMatch<IsCaseInsensitive>(pattern, sText, cchText))
-        {
-            continue;
         }
 
         if (EvaluatePatternSuffix<IsCaseInsensitive>(pattern, sText, cchText))
@@ -1719,40 +1784,21 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
                         continue;
                     }
 
+                    if (cchLength < cchText)
+                    {
+                        if (pattern.WildcardSuffix.Length == 0 || !EvaluateTailMatch<IsCaseInsensitive>(pattern, sText, cchText))
+                        {
+                            continue;
+                        }
+                    }
+
                     if (EvaluatePrefixMatch<IsCaseInsensitive>(pattern, sText, cchLength))
                     {
-                        if (cchLength == cchText)
+                        if (cchLength == cchText || EvaluatePatternSuffix<IsCaseInsensitive>(pattern, sText + cchLength, cchText - cchLength))
                         {
-                            bool bOnlyStars = true;
-                            
-                            for (UINT32 i = 0; i < pattern.WildcardSuffix.Length; ++i)
+                            if (Collector(&m_ContextArena[pattern.ContextIndex]))
                             {
-                                if (pattern.WildcardSuffix.Buffer[i] != kStar)
-                                {
-                                    bOnlyStars = false;
-                                    break;
-                                }
-                            }
-
-                            if (bOnlyStars)
-                            {
-                                if (Collector(&m_ContextArena[pattern.ContextIndex]))
-                                {
-                                    return true;
-                                }
-                            }
-                        }
-                        else
-                        {
-                            if (EvaluateTailMatch<IsCaseInsensitive>(pattern, sText, cchText))
-                            {
-                                if (EvaluatePatternSuffix<IsCaseInsensitive>(pattern, sText + cchLength, cchText - cchLength))
-                                {
-                                    if (Collector(&m_ContextArena[pattern.ContextIndex]))
-                                    {
-                                        return true;
-                                    }
-                                }
+                                return true;
                             }
                         }
                     }
@@ -1795,13 +1841,17 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::WildCardMatch(_In_reads_(c
     const TChar* StringEnd  = sText + cchText;
     const TChar* PatternEnd = sPattern + cchPattern;
 
-    const TChar* lastStarP        = nullptr;
-    const TChar* lastStarS        = nullptr;
+    const TChar* lastStarP              = nullptr;
+    const TChar* lastStarS              = nullptr;
     UINT32       starRemainingMinLength = 0;
+    TChar        starTarget             = 0;
+    UINT64       starTargetMask         = 0;
+    bool         starCanFastForward     = false;
 
     // Fast-Forward Engine: Propels the evaluation cursor O(N) towards the required sequence 
     // without invoking recursive state transitions inside the wildcard state machine loop.
-    auto fastForward = [&](TChar target) -> bool
+    auto fastForward = [&](TChar  target,
+                           [[maybe_unused]] UINT64 targetMask) -> bool
     {
         auto checkChar = [&](TChar c) -> bool
         {
@@ -1815,67 +1865,162 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::WildCardMatch(_In_reads_(c
             }
         };
 
-        while (s + 3 < StringEnd)
+        // Bound scan window to positions where sufficient characters remain to satisfy remainingMinLength
+        const TChar* SearchEnd = StringEnd - (remainingMinLength - 1);
+
+        if constexpr (sizeof(TChar) == 1 || IsCaseInsensitive)
         {
-            if (checkChar(s[0])) 
+            // 64-bit SWAR block scan: Evaluates 8 CHARs or 4 case-insensitive WCHARs simultaneously
+            while (s + kCharsPerBlock <= SearchEnd)
             {
-                return true;
-            }
-            
-            if constexpr (LimitWildScope)
-            {
-                if (KmStringPatternMatchDetail::IsPathSeparator(s[0])) [[unlikely]]
+                UINT64 w;
+                memcpy(&w, s, sizeof(UINT64));
+
+                bool bUseSwar = true;
+                if constexpr (IsCaseInsensitive)
                 {
-                    return false;
+                    if (KmStringPatternMatchDetail::IsAsciiSWAR<TChar>(w)) [[likely]]
+                    {
+                        w = KmStringPatternMatchDetail::ToUpperSWAR<TChar>(w);
+                    }
+                    else
+                    {
+                        bUseSwar = false;
+                    }
                 }
-            }
-            
-            if (checkChar(s[1])) 
-            { 
-                s += 1; 
-                return true; 
-            }
-            
-            if constexpr (LimitWildScope)
-            {
-                if (KmStringPatternMatchDetail::IsPathSeparator(s[1])) [[unlikely]]
+
+                if (bUseSwar) [[likely]]
                 {
-                    return false;
+                    constexpr UINT64 kLowBits  = (sizeof(TChar) == 1) ? 0x0101010101010101ULL : 0x0001000100010001ULL;
+                    constexpr UINT64 kHighBits = (sizeof(TChar) == 1) ? 0x8080808080808080ULL : 0x8000800080008000ULL;
+
+                    UINT64 diff     = w ^ targetMask;
+                    UINT64 hasMatch = (diff - kLowBits) & ~diff & kHighBits;
+
+                    if constexpr (LimitWildScope)
+                    {
+                        constexpr UINT64 kSepMask = (sizeof(TChar) == 1) ? 0x5C5C5C5C5C5C5C5CULL : 0x005C005C005C005CULL;
+                        UINT64           sepDiff  = w ^ kSepMask;
+                        UINT64           hasSep   = (sepDiff - kLowBits) & ~sepDiff & kHighBits;
+                        UINT64           combined = hasMatch | hasSep;
+
+                        if (combined == 0)
+                        {
+                            s += kCharsPerBlock;
+                            continue;
+                        }
+
+                        ULONG bitIndex = 0;
+                        _BitScanForward64(&bitIndex, combined);
+                        if (SPM_BIT_TEST64(hasMatch, bitIndex))
+                        {
+                            s += (bitIndex / (sizeof(TChar) * 8));
+                            return true;
+                        }
+
+                        return false;
+                    }
+                    else
+                    {
+                        if (hasMatch == 0)
+                        {
+                            s += kCharsPerBlock;
+                            continue;
+                        }
+
+                        ULONG bitIndex = 0;
+                        _BitScanForward64(&bitIndex, hasMatch);
+                        s += (bitIndex / (sizeof(TChar) * 8));
+                        return true;
+                    }
                 }
-            }
-            
-            if (checkChar(s[2])) 
-            { 
-                s += 2; 
-                return true; 
-            }
-            
-            if constexpr (LimitWildScope)
-            {
-                if (KmStringPatternMatchDetail::IsPathSeparator(s[2])) [[unlikely]]
+
+                // Scalar fallback for non-ASCII WCHAR blocks in case-insensitive mode
+                for (UINT32 k = 0; k < kCharsPerBlock; ++k)
                 {
-                    return false;
+                    if (checkChar(s[k]))
+                    {
+                        s += k;
+                        return true;
+                    }
+
+                    if constexpr (LimitWildScope)
+                    {
+                        if (KmStringPatternMatchDetail::IsPathSeparator(s[k])) [[unlikely]]
+                        {
+                            return false;
+                        }
+                    }
                 }
+
+                s += kCharsPerBlock;
             }
-            
-            if (checkChar(s[3])) 
-            { 
-                s += 3; 
-                return true; 
-            }
-            
-            if constexpr (LimitWildScope)
+        }
+        else
+        {
+            // 4-way unrolled scalar scan for case-sensitive WCHAR
+            while (s + 3 < SearchEnd)
             {
-                if (KmStringPatternMatchDetail::IsPathSeparator(s[3])) [[unlikely]]
+                if (checkChar(s[0])) 
                 {
-                    return false;
+                    return true;
                 }
+                
+                if constexpr (LimitWildScope)
+                {
+                    if (KmStringPatternMatchDetail::IsPathSeparator(s[0])) [[unlikely]]
+                    {
+                        return false;
+                    }
+                }
+                
+                if (checkChar(s[1])) 
+                { 
+                    s += 1; 
+                    return true; 
+                }
+                
+                if constexpr (LimitWildScope)
+                {
+                    if (KmStringPatternMatchDetail::IsPathSeparator(s[1])) [[unlikely]]
+                    {
+                        return false;
+                    }
+                }
+                
+                if (checkChar(s[2])) 
+                { 
+                    s += 2; 
+                    return true; 
+                }
+                
+                if constexpr (LimitWildScope)
+                {
+                    if (KmStringPatternMatchDetail::IsPathSeparator(s[2])) [[unlikely]]
+                    {
+                        return false;
+                    }
+                }
+                
+                if (checkChar(s[3])) 
+                { 
+                    s += 3; 
+                    return true; 
+                }
+                
+                if constexpr (LimitWildScope)
+                {
+                    if (KmStringPatternMatchDetail::IsPathSeparator(s[3])) [[unlikely]]
+                    {
+                        return false;
+                    }
+                }
+                
+                s += 4;
             }
-            
-            s += 4;
         }
         
-        while (s < StringEnd)
+        while (s < SearchEnd)
         {
             if (checkChar(*s)) 
             {
@@ -1947,30 +2092,37 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::WildCardMatch(_In_reads_(c
                         return true;
                     }
 
-                    lastStarP = p;
+                    lastStarP              = p;
                     starRemainingMinLength = remainingMinLength;
 
                     // Engage the linear fast-forward cursor instead of locking into character increments
-                    TChar target         = 0;
-                    bool  canFastForward = false;
+                    starTarget         = 0;
+                    starTargetMask     = 0;
+                    starCanFastForward = false;
                     
                     if (*p != kQuestion)
                     {
                         if (*p == kEscape && p + 1 < PatternEnd && (p[1] == kStar || p[1] == kQuestion || p[1] == kEscape))
                         {
-                            target = p[1];
-                            canFastForward = true;
+                            starTarget         = p[1];
+                            starCanFastForward = true;
                         }
                         else
                         {
-                            target = *p;
-                            canFastForward = true;
+                            starTarget         = *p;
+                            starCanFastForward = true;
                         }
-                    }
 
-                    if (canFastForward)
-                    {
-                        if (!fastForward(target))
+                        if constexpr (sizeof(TChar) == 1)
+                        {
+                            starTargetMask = 0x0101010101010101ULL * static_cast<UINT8>(starTarget);
+                        }
+                        else
+                        {
+                            starTargetMask = 0x0001000100010001ULL * static_cast<UINT16>(starTarget);
+                        }
+
+                        if (!fastForward(starTarget, starTargetMask))
                         {
                             return false;
                         }
@@ -2063,28 +2215,16 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::WildCardMatch(_In_reads_(c
             p = lastStarP;
             s = lastStarS + 1; // Increment to resume backtracking past previous failure position
             remainingMinLength = starRemainingMinLength;
+
+            if (static_cast<UINT32>(StringEnd - s) < remainingMinLength)
+            {
+                return false;
+            }
             
             // Re-engage the linear fast-forward cursor for subsequent tracking jumps
-            TChar target         = 0;
-            bool  canFastForward = false;
-            
-            if (*p != kQuestion)
+            if (starCanFastForward)
             {
-                if (*p == kEscape && p + 1 < PatternEnd && (p[1] == kStar || p[1] == kQuestion || p[1] == kEscape))
-                {
-                    target = p[1];
-                    canFastForward = true;
-                }
-                else
-                {
-                    target = *p; 
-                    canFastForward = true;
-                }
-            }
-
-            if (canFastForward)
-            {
-                if (!fastForward(target)) 
+                if (!fastForward(starTarget, starTargetMask)) 
                 {
                     return false;
                 }
