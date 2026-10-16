@@ -14,6 +14,7 @@
 
 #pragma once
 #include <ntddk.h>
+#include "PlatformUtils.h"
 
 #ifndef SIZE_MAX
 #define SIZE_MAX ((SIZE_T)(~((SIZE_T)0)))
@@ -40,6 +41,13 @@
 template <typename T, POOL_FLAGS PoolType = POOL_FLAG_NON_PAGED, SIZE_T BlockCapacity = 512, ULONG PoolTag = 'qeDK'>
 class KDeque
 {
+    static_assert(BlockCapacity > 0 && (BlockCapacity & (BlockCapacity - 1)) == 0,
+        "BlockCapacity must be a non-zero power of 2.");
+    static_assert(BlockCapacity <= (SIZE_MAX / sizeof(T)),
+        "BlockCapacity exceeds size limits.");
+    static_assert(alignof(T) <= MEMORY_ALLOCATION_ALIGNMENT,
+        "KDeque requires alignof(T) <= MEMORY_ALLOCATION_ALIGNMENT (16 bytes) for kernel pool allocations.");
+
 private:
 
     //--------------------------------------------------------------------------------
@@ -69,6 +77,41 @@ private:
     static constexpr SIZE_T BlockShift = Log2(BlockCapacity);
     static constexpr SIZE_T BlockMask  = BlockCapacity - 1;
 
+    //--------------------------------------------------------------------------------
+    // Out-of-line slow path for allocating a new segment block when crossing a block
+    // boundary (once every BlockCapacity insertions). Keeps EmplaceBack a tiny leaf
+    // function on the hot path so caller loops inline and unroll without register spills.
+    //
+    // Parameters:
+    //   BlockIndex - The target block slot index to validate and allocate.
+    //
+    // Return:
+    //   STATUS_SUCCESS on success, STATUS_QUOTA_EXCEEDED if BlockIndex >= kMaxBlocks,
+    //   or STATUS_INSUFFICIENT_RESOURCES on pool allocation failure.
+    //--------------------------------------------------------------------------------
+    __declspec(noinline) NTSTATUS AllocateBlock(_In_ SIZE_T BlockIndex) noexcept
+    {
+        // Ensure we do not exceed the maximum number of statically tracked blocks.
+        if (BlockIndex >= kMaxBlocks) [[unlikely]]
+        {
+            return STATUS_QUOTA_EXCEEDED;
+        }
+
+        if (m_Blocks[BlockIndex] == nullptr) [[likely]]
+        {
+            constexpr POOL_FLAGS allocFlags = PoolType | POOL_FLAG_UNINITIALIZED;
+            
+            m_Blocks[BlockIndex] = static_cast<T*>(ExAllocatePool2(allocFlags, BlockCapacity * sizeof(T), PoolTag));
+            
+            if (m_Blocks[BlockIndex] == nullptr) [[unlikely]]
+            {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+        }
+
+        return STATUS_SUCCESS;
+    }
+
 public:
     //--------------------------------------------------------------------------------
     // Initializes an empty KDeque, zeroing out the block tracking array.
@@ -76,6 +119,37 @@ public:
     KDeque() noexcept : m_Size(0)
     {
         RtlZeroMemory(m_Blocks, sizeof(m_Blocks));
+    }
+
+    KDeque(const KDeque&) = delete;
+    KDeque& operator=(const KDeque&) = delete;
+
+    //--------------------------------------------------------------------------------
+    // Move constructor transferring block ownership in O(1) without pool allocations.
+    //--------------------------------------------------------------------------------
+    KDeque(KDeque&& Other) noexcept : m_Size(Other.m_Size)
+    {
+        RtlCopyMemory(m_Blocks, Other.m_Blocks, sizeof(m_Blocks));
+        RtlZeroMemory(Other.m_Blocks, sizeof(Other.m_Blocks));
+        Other.m_Size = 0;
+    }
+
+    //--------------------------------------------------------------------------------
+    // Move assignment operator releasing current blocks and taking ownership of Other.
+    //--------------------------------------------------------------------------------
+    KDeque& operator=(KDeque&& Other) noexcept
+    {
+        if (this != &Other)
+        {
+            Clear();
+            RtlCopyMemory(m_Blocks, Other.m_Blocks, sizeof(m_Blocks));
+            m_Size = Other.m_Size;
+
+            RtlZeroMemory(Other.m_Blocks, sizeof(Other.m_Blocks));
+            Other.m_Size = 0;
+        }
+
+        return *this;
     }
 
     //--------------------------------------------------------------------------------
@@ -98,37 +172,27 @@ public:
     //   STATUS_INSUFFICIENT_RESOURCES if kernel pool allocation fails.
     //--------------------------------------------------------------------------------
     template <typename... Args>
-    NTSTATUS EmplaceBack(_In_ Args&&... arguments) noexcept
+    __forceinline NTSTATUS EmplaceBack(_In_ Args&&... arguments) noexcept
     {
-        static_assert((BlockCapacity & (BlockCapacity - 1)) == 0, "BlockCapacity must be a power of 2.");
-        static_assert(BlockCapacity <= (SIZE_MAX / sizeof(T)), "BlockCapacity exceeds size limits.");
+        const SIZE_T currentSize = m_Size;
+        const SIZE_T slotIndex   = currentSize & BlockMask;
 
-        SIZE_T blockIndex = m_Size >> BlockShift;
-        SIZE_T slotIndex  = m_Size & BlockMask;
-
-        // Ensure we do not exceed the maximum number of statically tracked blocks.
-        if (blockIndex >= kMaxBlocks) [[unlikely]]
+        // A new block is only ever needed at the start of a block (slotIndex == 0).
+        // For slots 1..BlockCapacity-1 (99.8% of calls), the block is guaranteed to be
+        // already allocated and within kMaxBlocks.
+        if (slotIndex == 0) [[unlikely]]
         {
-            return STATUS_QUOTA_EXCEEDED;
-        }
-
-        // Allocate a new block dynamically if the current block index is uninitialized.
-        if (m_Blocks[blockIndex] == nullptr) [[unlikely]]
-        {
-            constexpr POOL_FLAGS allocFlags = PoolType | POOL_FLAG_UNINITIALIZED;
-            
-            m_Blocks[blockIndex] = static_cast<T*>(ExAllocatePool2(allocFlags, BlockCapacity * sizeof(T), PoolTag));
-            
-            if (m_Blocks[blockIndex] == nullptr) [[unlikely]]
+            NTSTATUS status = AllocateBlock(currentSize >> BlockShift);
+            if (!NT_SUCCESS(status)) [[unlikely]]
             {
-                return STATUS_INSUFFICIENT_RESOURCES;
+                return status;
             }
         }
 
         // Locate the exact slot within the block and construct the object.
-        T* pSlot = &m_Blocks[blockIndex][slotIndex];
-        new (pSlot) T(kstd::forward<Args>(arguments)...);
-        m_Size++;
+        T* __restrict pBlock = m_Blocks[currentSize >> BlockShift];
+        new (&pBlock[slotIndex]) T(kstd::forward<Args>(arguments)...);
+        m_Size = currentSize + 1;
 
         return STATUS_SUCCESS;
     }
@@ -147,22 +211,55 @@ public:
     }
 
     //--------------------------------------------------------------------------------
+    // Retrieves a const reference to the last element in the deque.
+    // Caller must ensure the deque is not empty prior to invocation.
+    //
+    // Return:
+    //   A constant reference to the most recently emplaced element.
+    //--------------------------------------------------------------------------------
+    const T& Back() const noexcept
+    {
+        SIZE_T lastIndex = m_Size - 1;
+        return m_Blocks[lastIndex >> BlockShift][lastIndex & BlockMask];
+    }
+
+    //--------------------------------------------------------------------------------
     // Clears all elements, invoking destructors if necessary, and frees underlying 
     // memory blocks.
     //--------------------------------------------------------------------------------
     void Clear() noexcept
     {
-        // Explicitly invoke destructors for complex types.
+        const SIZE_T fullBlocks = m_Size >> BlockShift;
+        const SIZE_T remSlots   = m_Size & BlockMask;
+
+        // Explicitly invoke destructors for complex types using contiguous block loops.
         if constexpr (!kstd::is_trivially_destructible_v<T>)
         {
-            for (SIZE_T i = 0; i < m_Size; i++)
+            for (SIZE_T b = 0; b < fullBlocks; b++)
             {
-                m_Blocks[i >> BlockShift][i & BlockMask].~T();
+                T* __restrict pBlock = m_Blocks[b];
+                for (SIZE_T s = 0; s < BlockCapacity; s++)
+                {
+                    pBlock[s].~T();
+                }
+            }
+
+            if (remSlots > 0)
+            {
+                T* __restrict pBlock = m_Blocks[fullBlocks];
+                for (SIZE_T s = 0; s < remSlots; s++)
+                {
+                    pBlock[s].~T();
+                }
             }
         }
 
-        // Free all allocated memory blocks and reset pointers.
-        for (SIZE_T i = 0; i < kMaxBlocks; i++)
+        // Only scan up to the highest potentially allocated block index.
+        // Note: if the first EmplaceBack of a new block allocated the block and then
+        // exited, at most fullBlocks + 1 blocks can be non-null.
+        const SIZE_T maxAllocatedBlocks = (fullBlocks < kMaxBlocks) ? (fullBlocks + 1) : kMaxBlocks;
+
+        for (SIZE_T i = 0; i < maxAllocatedBlocks; i++)
         {
             if (m_Blocks[i] != nullptr)
             {
@@ -184,7 +281,7 @@ public:
     // Return:
     //   A mutable reference to the stored element.
     //--------------------------------------------------------------------------------
-    T& operator[](_In_ SIZE_T Index) noexcept
+    __forceinline T& operator[](_In_ SIZE_T Index) noexcept
     {
         return m_Blocks[Index >> BlockShift][Index & BlockMask];
     }
@@ -199,7 +296,7 @@ public:
     // Return:
     //   A constant reference to the stored element.
     //--------------------------------------------------------------------------------
-    const T& operator[](_In_ SIZE_T Index) const noexcept
+    __forceinline const T& operator[](_In_ SIZE_T Index) const noexcept
     {
         return m_Blocks[Index >> BlockShift][Index & BlockMask];
     }
@@ -213,6 +310,17 @@ public:
     SIZE_T Size() const noexcept
     {
         return m_Size;
+    }
+
+    //--------------------------------------------------------------------------------
+    // Evaluates whether the deque currently contains zero elements.
+    //
+    // Return:
+    //   True if the deque is empty, false otherwise.
+    //--------------------------------------------------------------------------------
+    bool IsEmpty() const noexcept
+    {
+        return m_Size == 0;
     }
 
 private:

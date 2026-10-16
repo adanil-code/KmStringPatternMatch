@@ -33,6 +33,9 @@
 template <typename T, POOL_FLAGS PoolType = POOL_FLAG_NON_PAGED, ULONG PoolTag = 'ceVK'>
 class KVector
 {
+    static_assert(alignof(T) <= MEMORY_ALLOCATION_ALIGNMENT,
+        "KVector requires alignof(T) <= MEMORY_ALLOCATION_ALIGNMENT (16 bytes) for kernel pool allocations.");
+
 private:
     //--------------------------------------------------------------------------------
     // Small Vector Optimization (SVO): Eliminates ExAllocatePool2 calls entirely for 
@@ -85,11 +88,16 @@ public:
     // Return:
     //   STATUS_SUCCESS upon identical state execution or an allocation failure flag.
     //--------------------------------------------------------------------------------
-    NTSTATUS Clone(_Out_ KVector* __restrict pOutVector) const noexcept
+    NTSTATUS Clone(_Inout_ KVector* __restrict pOutVector) const noexcept
     {
         if (pOutVector == nullptr) [[unlikely]]
         {
             return STATUS_INVALID_PARAMETER;
+        }
+
+        if (pOutVector == this) [[unlikely]]
+        {
+            return STATUS_SUCCESS;
         }
 
         pOutVector->Clear();
@@ -312,12 +320,13 @@ public:
     //   STATUS_SUCCESS or NTSTATUS code resolving potential ExAllocate limits.
     //--------------------------------------------------------------------------------
     template <typename... Args>
-    NTSTATUS EmplaceBack(_In_ Args&&... arguments) noexcept
+    __forceinline NTSTATUS EmplaceBack(_In_ Args&&... arguments) noexcept
     {
-        if (m_Last < m_End) [[likely]]
+        T* __restrict pLast = m_Last;
+        if (pLast < m_End) [[likely]]
         {
-            new (m_Last) T(kstd::forward<Args>(arguments)...);
-            m_Last++;
+            new (pLast) T(kstd::forward<Args>(arguments)...);
+            m_Last = pLast + 1;
             return STATUS_SUCCESS;
         }
 
@@ -334,20 +343,21 @@ public:
     // Return:
     //   STATUS_SUCCESS or pool failure code limit hit.
     //--------------------------------------------------------------------------------
-    NTSTATUS PushBack(_In_ const T& Value) noexcept
+    __forceinline NTSTATUS PushBack(_In_ const T& Value) noexcept
     {
-        if (m_Last < m_End) [[likely]]
+        T* __restrict pLast = m_Last;
+        if (pLast < m_End) [[likely]]
         {
             if constexpr (kstd::is_trivially_copyable_v<T>)
             {
-                *m_Last = Value;
+                *pLast = Value;
             }
             else
             {
-                new (m_Last) T(Value);
+                new (pLast) T(Value);
             }
 
-            m_Last++;
+            m_Last = pLast + 1;
             return STATUS_SUCCESS;
         }
 
@@ -363,20 +373,21 @@ public:
     // Return:
     //   STATUS_SUCCESS or NTSTATUS failure constraint limits.
     //--------------------------------------------------------------------------------
-    NTSTATUS PushBack(_In_ T&& Value) noexcept
+    __forceinline NTSTATUS PushBack(_In_ T&& Value) noexcept
     {
-        if (m_Last < m_End) [[likely]]
+        T* __restrict pLast = m_Last;
+        if (pLast < m_End) [[likely]]
         {
             if constexpr (kstd::is_trivially_copyable_v<T>)
             {
-                *m_Last = Value;
+                *pLast = Value;
             }
             else
             {
-                new (m_Last) T(kstd::move(Value));
+                new (pLast) T(kstd::move(Value));
             }
 
-            m_Last++;
+            m_Last = pLast + 1;
             return STATUS_SUCCESS;
         }
 
@@ -396,13 +407,23 @@ public:
     NTSTATUS Insert(_In_       T* Position,
                     _In_ const T& Value) noexcept
     {
-        SIZE_T index      = Position - m_First;
+        if (Position < m_First || Position > m_Last) [[unlikely]]
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        SIZE_T index      = static_cast<SIZE_T>(Position - m_First);
         T      localValue = Value;
 
         if (m_Last >= m_End) [[unlikely]]
         {
-            NTSTATUS status = Grow();
-            
+            SIZE_T newCapacity = 0;
+            if (!NT_SUCCESS(ComputeNextCapacity(&newCapacity))) [[unlikely]]
+            {
+                return STATUS_INTEGER_OVERFLOW;
+            }
+
+            NTSTATUS status = Reserve(newCapacity);
             if (!NT_SUCCESS(status)) [[unlikely]]
             {
                 return status;
@@ -472,7 +493,7 @@ public:
     // Return:
     //   Mutable item matching standard array behaviors.
     //--------------------------------------------------------------------------------
-    T& operator[](_In_ SIZE_T Index) noexcept
+    __forceinline T& operator[](_In_ SIZE_T Index) noexcept
     {
         return m_First[Index];
     }
@@ -486,7 +507,7 @@ public:
     // Return:
     //   Readonly evaluation reference matching array limits.
     //--------------------------------------------------------------------------------
-    const T& operator[](_In_ SIZE_T Index) const noexcept
+    __forceinline const T& operator[](_In_ SIZE_T Index) const noexcept
     {
         return m_First[Index];
     }
@@ -504,6 +525,18 @@ public:
     }
 
     //--------------------------------------------------------------------------------
+    // Const accessor navigating immediately bounding elements inside current size limits.
+    // Caller must evaluate for zero sizes.
+    //
+    // Return:
+    //   Const element representation mapped at container terminal bounds.
+    //--------------------------------------------------------------------------------
+    const T& Back() const noexcept
+    {
+        return *(m_Last - 1);
+    }
+
+    //--------------------------------------------------------------------------------
     // Enumerates actively allocated instance lengths rather than true overall memory 
     // capacity limits tracking bytes parameters constraints.
     //
@@ -513,6 +546,17 @@ public:
     SIZE_T Size() const noexcept
     {
         return static_cast<SIZE_T>(m_Last - m_First);
+    }
+
+    //--------------------------------------------------------------------------------
+    // Returns the total number of elements the vector can hold before reallocating.
+    //
+    // Return:
+    //   Current allocated capacity of the vector.
+    //--------------------------------------------------------------------------------
+    SIZE_T Capacity() const noexcept
+    {
+        return static_cast<SIZE_T>(m_End - m_First);
     }
 
     //--------------------------------------------------------------------------------
@@ -572,129 +616,97 @@ public:
 
 private:
     //--------------------------------------------------------------------------------
-    // Triggers a 1.5x/2x allocation growth curve when capacity is exhausted.
-    // Marked noinline to keep the primary container mutation functions lean.
-    //
-    // Return:
-    //   STATUS_SUCCESS or pool failure execution limits.
+    // Computes the next capacity step along the 1.5x/2x growth curve.
     //--------------------------------------------------------------------------------
-    __declspec(noinline) NTSTATUS Grow() noexcept
+    NTSTATUS ComputeNextCapacity(_Out_ SIZE_T* pNewCapacity) const noexcept
     {
         SIZE_T capacity = static_cast<SIZE_T>(m_End - m_First);
-        SIZE_T newCapacity = 0;
 
-        if (capacity == 0) [[unlikely]]
+        if (capacity < 4) [[unlikely]]
         {
-            newCapacity = 8;
-        }
-        else if (capacity < 1024)
-        {
-            if (!NT_SUCCESS(RtlSizeTMult(capacity, 2, &newCapacity))) [[unlikely]]
-            {
-                return STATUS_INTEGER_OVERFLOW;
-            }
-        }
-        else
-        {
-            SIZE_T halfCapacity = capacity >> 1;
-            
-            if (!NT_SUCCESS(RtlSizeTAdd(capacity, halfCapacity, &newCapacity))) [[unlikely]]
-            {
-                return STATUS_INTEGER_OVERFLOW;
-            }
+            *pNewCapacity = 8;
+            return STATUS_SUCCESS;
         }
 
-        return Reserve(newCapacity);
+        if (capacity < 1024)
+        {
+            return RtlSizeTMult(capacity, 2, pNewCapacity);
+        }
+
+        return RtlSizeTAdd(capacity, capacity >> 1, pNewCapacity);
     }
 
     //--------------------------------------------------------------------------------
-    // Out-of-line slow paths for vector reallocation. Keeps PushBack and EmplaceBack
-    // leaf-like on the critical path, enabling aggressive compiler loop unrolling.
-    //
-    // Parameters:
-    //   Value - The constant reference to the value being appended to the newly 
-    //           allocated vector.
-    //
-    // Return:
-    //   STATUS_SUCCESS upon successful reallocation and insertion, or an NTSTATUS 
-    //   error code.
-    //--------------------------------------------------------------------------------
-    __declspec(noinline) NTSTATUS GrowAndPush(_In_ const T& Value) noexcept
-    {
-        NTSTATUS status = Grow();
-        if (!NT_SUCCESS(status)) [[unlikely]]
-        {
-            return status;
-        }
-
-        if constexpr (kstd::is_trivially_copyable_v<T>)
-        {
-            *m_Last = Value;
-        }
-        else
-        {
-            new (m_Last) T(Value);
-        }
-
-        m_Last++;
-        return STATUS_SUCCESS;
-    }
-
-    //--------------------------------------------------------------------------------
-    // Out-of-line slow path for vector reallocation via rvalue reference.
-    // Keeps PushBack leaf-like on the critical path while supporting move semantics.
-    //
-    // Parameters:
-    //   Value - The mutable rvalue reference to the value being moved into the newly
-    //           allocated vector.
-    //
-    // Return:
-    //   STATUS_SUCCESS upon successful reallocation and insertion, or an NTSTATUS 
-    //   error code.
-    //--------------------------------------------------------------------------------
-    __declspec(noinline) NTSTATUS GrowAndPush(_In_ T&& Value) noexcept
-    {
-        NTSTATUS status = Grow();
-        if (!NT_SUCCESS(status)) [[unlikely]]
-        {
-            return status;
-        }
-
-        if constexpr (kstd::is_trivially_copyable_v<T>)
-        {
-            *m_Last = Value;
-        }
-        else
-        {
-            new (m_Last) T(kstd::move(Value));
-        }
-
-        m_Last++;
-        return STATUS_SUCCESS;
-    }
-
-    //--------------------------------------------------------------------------------
-    // Out-of-line slow path for vector reallocation via in-place construction.
-    // Keeps EmplaceBack leaf-like on the critical path while supporting forwarding.
-    //
-    // Parameters:
-    //   arguments - Variadic template arguments forwarded to the element's constructor.
-    //
-    // Return:
-    //   STATUS_SUCCESS upon successful reallocation and construction, or an NTSTATUS 
-    //   error code.
+    // Out-of-line slow path for vector reallocation and in-place construction.
+    // Allocates the new buffer FIRST so that:
+    //   1. If ExAllocatePool2 fails, rvalue arguments are never consumed/destroyed.
+    //   2. The new element is constructed before old elements are moved/freed,
+    //      preventing Use-After-Free if arguments alias an element inside *this.
+    //   3. Zero sizeof(T) temporary space is consumed on the limited kernel stack.
     //--------------------------------------------------------------------------------
     template <typename... Args>
     __declspec(noinline) NTSTATUS GrowAndEmplace(_In_ Args&&... arguments) noexcept
     {
-        NTSTATUS status = Grow();
-        if (!NT_SUCCESS(status)) [[unlikely]]
+        SIZE_T newCapacity = 0;
+        if (!NT_SUCCESS(ComputeNextCapacity(&newCapacity))) [[unlikely]]
         {
-            return status;
+            return STATUS_INTEGER_OVERFLOW;
         }
 
-        new (m_Last) T(kstd::forward<Args>(arguments)...);
-        m_Last++;
+        SIZE_T allocationSize = 0;
+        if (!NT_SUCCESS(RtlSizeTMult(newCapacity, sizeof(T), &allocationSize))) [[unlikely]]
+        {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
+        constexpr POOL_FLAGS allocFlags = PoolType | POOL_FLAG_UNINITIALIZED;
+        T* __restrict pNewData = static_cast<T*>(ExAllocatePool2(allocFlags, allocationSize, PoolTag));
+        if (pNewData == nullptr) [[unlikely]]
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        const SIZE_T currentSize = static_cast<SIZE_T>(m_Last - m_First);
+
+        // Construct the new element in the new buffer BEFORE touching m_First
+        // so self-referential arguments (e.g. vec.EmplaceBack(vec[0])) remain valid.
+        new (&pNewData[currentSize]) T(kstd::forward<Args>(arguments)...);
+
+        if (currentSize > 0)
+        {
+            if constexpr (kstd::is_trivially_copyable_v<T>)
+            {
+                RtlCopyMemory(pNewData, m_First, currentSize * sizeof(T));
+            }
+            else
+            {
+                for (SIZE_T i = 0; i < currentSize; i++)
+                {
+                    new (&pNewData[i]) T(kstd::move(m_First[i]));
+                    m_First[i].~T();
+                }
+            }
+        }
+
+        if (IsDynamic() && m_First != nullptr)
+        {
+            ExFreePoolWithTag(m_First, PoolTag);
+        }
+
+        m_First = pNewData;
+        m_Last  = pNewData + currentSize + 1;
+        m_End   = pNewData + newCapacity;
+
         return STATUS_SUCCESS;
+    }
+
+    __declspec(noinline) NTSTATUS GrowAndPush(_In_ const T& Value) noexcept
+    {
+        return GrowAndEmplace(Value);
+    }
+
+    __declspec(noinline) NTSTATUS GrowAndPush(_In_ T&& Value) noexcept
+    {
+        return GrowAndEmplace(kstd::move(Value));
     }
 };
