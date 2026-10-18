@@ -271,28 +271,28 @@ Kernel-mode performance benchmarking demands strict control over system state to
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **890 MB/s** | **16.7 Million** | **60 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **1,683 MB/s** | **15.8 Million** | **63 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **2,350 MB/s** | **19.3 Million** | **52 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,605 MB/s** | **10.7 Million** | **94 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **70 MB/s** | **7,250** | **137.9 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **63 MB/s** | **3,242** | **308.5 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **2,012 MB/s** | **20.6 K** | **48.5 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,740 MB/s** | **8.9 K** | **112.2 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **931 MB/s** | **17.5 Million** | **57 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **1,709 MB/s** | **16.0 Million** | **62 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **2,343 MB/s** | **19.2 Million** | **52 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,660 MB/s** | **10.9 Million** | **92 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **68 MB/s** | **7,022** | **142.4 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **63 MB/s** | **3,231** | **309.5 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,957 MB/s** | **20.0 K** | **49.9 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,764 MB/s** | **9.0 K** | **110.7 µs** |
 
 #### Virtualized Guest (VMware on Intel Core i7-8086K)
 *Environment: Windows 11 Virtual Machine (VMware Workstation) hosted on Intel Core i7-8086K. High-priority thread execution.*
 
 | Workload Profile | Pattern Count | Target Text Length | String Type | Throughput | Operations/sec | Latency/Op |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **800 MB/s** | **15.0 Million** | **67 ns** |
-| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **1,484 MB/s** | **13.9 Million** | **72 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **2,012 MB/s** | **16.5 Million** | **61 ns** |
-| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,444 MB/s** | **10.0 Million** | **100 ns** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **45 MB/s** | **4,608** | **217.0 µs** |
-| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **31 MB/s** | **1,611** | **620.7 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,924 MB/s** | **19.7 K** | **50.7 µs** |
-| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,540 MB/s** | **7.9 K** | **126.8 µs** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `CHAR` | **832 MB/s** | **15.6 Million** | **64 ns** |
+| **Realistic File Paths** | 1,000 | 56 Characters | `WCHAR`| **1,500 MB/s** | **14.0 Million** | **71 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `CHAR` | **2,103 MB/s** | **17.2 Million** | **58 ns** |
+| **Exact Match (No Wildcards)** | 100 | 128 Characters | `WCHAR`| **2,843 MB/s** | **11.6 Million** | **86 ns** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `CHAR` | **45 MB/s** | **4,644** | **215.3 µs** |
+| **Meaningful Prose (`*xxx*`)** | 100 | 10,240 Characters | `WCHAR`| **38 MB/s** | **1,951** | **512.6 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `CHAR` | **1,998 MB/s** | **20.5 K** | **48.9 µs** |
+| **Heavy Pathological (`*A%dB*`)**| 1,000 | 102,400 Characters | `WCHAR`| **1,605 MB/s** | **8.2 K** | **121.7 µs** |
 
 > **Pattern Scaling Performance** — comparison between `CHAR` and `WCHAR` engines evaluating realistic file path patterns (e.g. `\\Device\\HarddiskVolume2\\Program Files\\App%u\\*\\crypt.exe`) across 10, 100, 1,000 and 10,000 pattern sets in MatchFirst mode.
 
@@ -309,7 +309,7 @@ Kernel-mode performance benchmarking demands strict control over system state to
   </tr>
 </table>
 
-Evaluating realistic paths requires an initial prefix hash lookup, an $O(1)$ SWAR tail-anchor check, and a wildcard evaluation over the remaining interior path segment. Scaling to 10,000 patterns expands the pattern metadata footprint. Across both bare-metal and virtualized environments, the engine demonstrates sustained scaling: `CHAR` throughput holds between 14.4M and 17.6M operations per second, while `WCHAR` throughput reliably maintains between 13.0M and 15.8M operations per second from 10 to 10,000 registered rules.
+Evaluating realistic paths requires an initial prefix hash lookup, an $O(1)$ SWAR tail-anchor check, and a wildcard evaluation over the remaining interior path segment. Scaling to 10,000 patterns expands the pattern metadata footprint. Across both bare-metal and virtualized environments, the engine demonstrates sustained scaling: `CHAR` throughput holds between 15.0M and 18.5M operations per second, while `WCHAR` throughput reliably maintains between 13.1M and 16.1M operations per second from 10 to 10,000 registered rules.
 
 > **Exact String Scaling Performance** — comparison between `CHAR` and `WCHAR` engines evaluating 128-char exact literal patterns across 10, 100, 1,000 and 10,000 pattern sets in MatchFirst mode.
 
@@ -326,7 +326,7 @@ Evaluating realistic paths requires an initial prefix hash lookup, an $O(1)$ SWA
   </tr>
 </table>
 
-For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 1024-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both mobile and desktop architectures to sustain flat baseline performance (reaching 10.0M to 10.7M ops/sec for `WCHAR` and up to 19.3M ops/sec for `CHAR`) without degradation from 10 to 10,000 registered patterns.
+For exact literal matching, the engine maintains nearly constant throughput across all density tiers. Lacking wildcards, these evaluations rely purely on the 1024-bit hash-existence filter and a single $O(1)$ hash map probe. Bypassing the wildcard state machine establishes a highly predictable memory access pattern. This minimizes cache thrashing, allowing both mobile and desktop architectures to sustain flat baseline performance (reaching 10.8M to 11.8M ops/sec for `WCHAR` and up to 19.7M ops/sec for `CHAR`) without degradation from 10 to 10,000 registered patterns.
 
 > **See Also:** For details on the isolated performance behavior of the underlying data structures, refer to the `/TestContainer/` description in the [Project Layout](#project-layout).
 ---

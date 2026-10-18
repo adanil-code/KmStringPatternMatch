@@ -278,6 +278,24 @@ namespace KmStringPatternMatchDetail
     }
 
     // -------------------------------------------------------------------------------------------
+    // Finalizes a rolling hash strictly prior to KFlatHashMap indexing.
+    // Pre-folds the upper 32 bits into the lower 32 bits before multiplying by kPrime so
+    // high-byte entropy avalanches across both the lower group index bits (3..k) and the
+    // upper 7 H2 control metadata bits (57..63), while decoupling the map index from the
+    // unfinalized low bits (0..9) inspected by m_HashFilter.
+    //
+    // Parameters:
+    //   Hash - The raw 64-bit rolling hash produced by CalculateHash / SearchInternal.
+    //
+    // Return:
+    //   The finalized 64-bit hash key for KFlatHashMap lookup or insertion.
+    // -------------------------------------------------------------------------------------------
+    __forceinline UINT64 FinalizeHash(_In_ UINT64 Hash) noexcept
+    {
+        return Mix64(Hash ^ (Hash >> 32));
+    }
+
+    // -------------------------------------------------------------------------------------------
     // Determines if a character is a path separator natively for the target OS.
     // Used exclusively when SCOPE_PATH_SEGMENT is active to halt wildcard expansion.
     //
@@ -692,8 +710,8 @@ private:
     KStringArena<TChar, PoolType> m_StringArena;  // Linear arena storing persistent pattern strings
     KDeque<TContext, PoolType>    m_ContextArena; // Flat storage preserving contextual payloads
     
-    KFlatHashMap<UINT64, KVector<PatternEntry, PoolType>, KPrecomputedHash, PoolType> m_HashMap;      // Prefix hash map mapping literal prefix hashes to pattern arrays
-    KVector<PatternEntry, PoolType>                                                   m_SlowPathList; // List of patterns starting immediately with wildcards
+    KFlatHashMap<UINT64, KVector<PatternEntry, PoolType>, KIdentityHash<UINT64>, PoolType> m_HashMap;      // Prefix hash map mapping literal prefix hashes to pattern arrays
+    KVector<PatternEntry, PoolType>                                                        m_SlowPathList; // List of patterns starting immediately with wildcards
 
     static constexpr TChar kStar     = static_cast<TChar>('*'); // Wildcard operator matching zero or more characters
     static constexpr TChar kQuestion = static_cast<TChar>('?'); // Wildcard operator matching exactly one character
@@ -730,7 +748,7 @@ KmStringPatternMatch<TContext, TChar, PoolType>::KmStringPatternMatch(_In_ bool 
 // Registers a pattern, parsing out literal prefixes and caching contexts in the arena.
 //
 // Parameters:
-//   sPattern      - Pointer to the character array defining the wildcard pattern.
+//   sPattern       - Pointer to the character array defining the wildcard pattern.
 //   cchPattern     - The length of the pattern in characters.
 //   WildScope      - The boundary scope to apply for wildcard operators.
 //   PatternContext - The user-defined context payload mapped to this specific pattern.
@@ -1067,7 +1085,7 @@ NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::AddPattern(_In_reads_(
     }
 
     KVector<PatternEntry, PoolType>* pBucket = nullptr;
-    status = m_HashMap.GetOrInsert(hash, &pBucket);
+    status = m_HashMap.GetOrInsert(KmStringPatternMatchDetail::FinalizeHash(hash), &pBucket);
     if (!NT_SUCCESS(status)) [[unlikely]]
     {
         m_StringArena.RevertBookmark(bookmark);
@@ -1769,7 +1787,7 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::SearchInternal(_In_reads_(
             continue;
         }
 
-        const KVector<PatternEntry, PoolType>* pBucket = m_HashMap.Find(Hash);
+        const KVector<PatternEntry, PoolType>* pBucket = m_HashMap.Find(KmStringPatternMatchDetail::FinalizeHash(Hash));
         
         if (pBucket != nullptr) [[likely]]
         {
