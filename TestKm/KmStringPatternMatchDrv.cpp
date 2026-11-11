@@ -103,9 +103,8 @@ VOID FlushLogToFile()
     }
 }
 
-#define LOG_INFO(...)      RecordLog(__VA_ARGS__)
-#define LOG_ERR(...)       RecordLog(__VA_ARGS__)
-#define COMPILER_BARRIER() _ReadWriteBarrier()
+#define LOG_INFO(...) RecordLog(__VA_ARGS__)
+#define LOG_ERR(...)  RecordLog(__VA_ARGS__)
 
 volatile LONG g_lAbortTests = 0;
 PETHREAD      g_pMasterBenchmarkThread = NULL;

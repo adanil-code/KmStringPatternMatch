@@ -67,7 +67,6 @@ typedef uint64_t POOL_FLAGS;
 // Environment & IRQL Mocks
 // -------------------------------------------------------------------------------------
 #define PAGED_CODE()
-#define COMPILER_BARRIER()            _ReadWriteBarrier()
 #define KeGetCurrentIrql()            0
 #define DISPATCH_LEVEL                2
 #define PASSIVE_LEVEL                 0

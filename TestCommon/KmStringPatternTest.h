@@ -32,15 +32,21 @@ extern VOID RecordLog(_In_ _Printf_format_string_ PCSTR pszFormat, ...);
 #define LOG_ERR(...) RecordLog(__VA_ARGS__)
 #endif
 
-#ifndef COMPILER_BARRIER
-#define COMPILER_BARRIER() _ReadWriteBarrier()
-#endif
-
 extern volatile LONG g_lAbortTests;
 
 VOID FlushLogToFile();
 
 #define MAX_TEST_THREADS 64
+
+// Orders all prior loads and stores before any subsequent loads and stores.
+__forceinline void KmReadWriteBarrier() noexcept
+{
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+    __dmb(_ARM64_BARRIER_ISH);
+#else
+    _ReadWriteBarrier();
+#endif
+}
 
 // Configuration structure allowing callers to selectively run modules
 struct TEST_SUITE_CONFIG
@@ -737,7 +743,7 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
                 }
 
                 localOps++;
-                COMPILER_BARRIER();
+                KmReadWriteBarrier();
             }
         }
         else
@@ -759,7 +765,7 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
                 }
 
                 localOps++;
-                COMPILER_BARRIER();
+                KmReadWriteBarrier();
             }
         }
 

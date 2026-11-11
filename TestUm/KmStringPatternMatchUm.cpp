@@ -26,10 +26,6 @@
 #define LOG_INFO(...)      do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #define LOG_ERR(...)       do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 
-#ifndef COMPILER_BARRIER
-#define COMPILER_BARRIER() _ReadWriteBarrier()
-#endif
-
 inline VOID FlushLogToFile()
 {}
 
