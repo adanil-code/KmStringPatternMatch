@@ -103,11 +103,12 @@ public:
     // -------------------------------------------------------------------------------------------
     TChar* Allocate(_In_ SIZE_T Length) noexcept
     {
-        // Data-Oriented Arena Alignment: Ensure all carved buffers are aligned to 8 bytes 
-        // to natively support fast SWAR block comparisons without hardware traps.
+        // Ensure all carved buffers are aligned to 8 bytes to natively support fast SWAR block 
+        // comparisons without hardware traps.
         constexpr SIZE_T charAlign = 8 / sizeof(TChar);
+        const SIZE_T     maxChars  = ((MAXULONG_PTR - FIELD_OFFSET(Slab, Buffer)) / sizeof(TChar)) & ~(charAlign - 1);
 
-        if (Length == 0 || Length > (MAXULONG_PTR - FIELD_OFFSET(Slab, Buffer) - charAlign) / sizeof(TChar)) [[unlikely]]
+        if (Length == 0 || Length > maxChars) [[unlikely]]
         {
             return nullptr;
         }
@@ -588,7 +589,7 @@ public:
     // -------------------------------------------------------------------------------------------
     NTSTATUS Search(_In_reads_(cchText) const TChar* __restrict             sText,
                     _In_                UINT32                              cchText,
-                    _Out_               KVector<TContext*, PoolType>&       PatternContexts) const noexcept;
+                    _Inout_             KVector<TContext*, PoolType>&       PatternContexts) const noexcept;
 
     // -------------------------------------------------------------------------------------------
     // Flushes all patterns, hash buckets, and memory arenas, resetting the engine to empty.
@@ -1196,7 +1197,7 @@ bool KmStringPatternMatch<TContext, TChar, PoolType>::Search(_In_reads_(cchText)
 template <typename TContext, typename TChar, POOL_FLAGS PoolType>
 NTSTATUS KmStringPatternMatch<TContext, TChar, PoolType>::Search(_In_reads_(cchText) const TChar* __restrict             sText,
                                                                  _In_                UINT32                              cchText,
-                                                                 _Out_               KVector<TContext*, PoolType>&       PatternContexts) const noexcept
+                                                                 _Inout_             KVector<TContext*, PoolType>&       PatternContexts) const noexcept
 {
     PatternContexts.Clear();
 
