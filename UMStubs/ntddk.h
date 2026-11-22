@@ -62,6 +62,8 @@ typedef uint64_t POOL_FLAGS;
 #define ALL_PROCESSOR_GROUPS          0xFFFF
 #endif
 
+#define PAGE_SIZE                     0x1000
+
 // -------------------------------------------------------------------------------------
 // Environment & IRQL Mocks
 // -------------------------------------------------------------------------------------
@@ -90,18 +92,36 @@ typedef uint64_t POOL_FLAGS;
 
 //--------------------------------------------------------------------------------
 // Allocates memory from the kernel pool. Uses aligned UM malloc as a stub.
+// Mirrors KM ExAllocatePool2 alignment rules: PAGE_SIZE for Size >= PAGE_SIZE,
+// 64 bytes for POOL_FLAG_CACHE_ALIGNED, and 16 bytes otherwise.
 //--------------------------------------------------------------------------------
 inline void* ExAllocatePool2(_In_ POOL_FLAGS Flags,
                              _In_ SIZE_T     Size,
                              _In_ ULONG      Tag)
 {
-    UNREFERENCED_PARAMETER(Tag);
-    
-    // Determine requested alignment: 64 bytes for CACHE_ALIGNED, standard 16 bytes otherwise
-    SIZE_T alignment = (Flags & POOL_FLAG_CACHE_ALIGNED) ? 64 : 16;
-    
+    // Real KM ExAllocatePool2 returns nullptr when Tag == 0, and Driver Verifier
+    // flags zero-length pool allocations.
+    if (Tag == 0 || Size == 0)
+    {
+        return nullptr;
+    }
+
+    // Match KM ExAllocatePool2 alignment guarantees:
+    //   - Size >= PAGE_SIZE: page-aligned (4096 bytes)
+    //   - POOL_FLAG_CACHE_ALIGNED: cache-line aligned (64 bytes)
+    //   - Otherwise: standard 64-bit pool alignment (16 bytes)
+    SIZE_T alignment = 16;
+    if (Size >= PAGE_SIZE)
+    {
+        alignment = PAGE_SIZE;
+    }
+    else if (Flags & POOL_FLAG_CACHE_ALIGNED)
+    {
+        alignment = 64;
+    }
+
     // Use _aligned_malloc universally so that _aligned_free can safely be used in ExFreePoolWithTag
-    void* p = _aligned_malloc(Size, alignment);    
+    void* p = _aligned_malloc(Size, alignment);
     if (p != nullptr)
     {
         // ExAllocatePool2 zero-initializes memory by default unless explicitly opted out
@@ -110,7 +130,7 @@ inline void* ExAllocatePool2(_In_ POOL_FLAGS Flags,
             std::memset(p, 0, Size);
         }
     }
-    
+
     return p;
 }
 

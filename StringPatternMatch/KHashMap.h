@@ -213,9 +213,9 @@ struct KDefaultHash
                     L1 = a1 * b1; H1 = __umulh(a1, b1);
                     L2 = a2 * b2; H2 = __umulh(a2, b2);
                 #endif
-                    // Feed-forward a1/b1 and a2/b2 so a zero multiplier never wipes prior state
-                    seed1 = L1 ^ H1 ^ a1 ^ _rotl64(b1, 31);
-                    seed2 = L2 ^ H2 ^ a2 ^ _rotl64(b2, 31);
+                    // Feed-forward pre-XOR seeds alongside a1/b1 and a2/b2 so a zero multiplier never wipes prior state
+                    seed1 = L1 ^ H1 ^ _rotl64(prevSeed1, 17) ^ a1 ^ _rotl64(b1, 31);
+                    seed2 = L2 ^ H2 ^ _rotl64(prevSeed2, 17) ^ a2 ^ _rotl64(b2, 31);
                 }
 
                 if constexpr ((sizeof(T) % 32) >= 16)
@@ -224,7 +224,9 @@ struct KDefaultHash
                     RtlCopyMemory(&a, p + i, 8);
                     RtlCopyMemory(&b, p + i + 8, 8);
 
-                    a ^= seed1;
+                    const UINT64 prevSeed1 = seed1;
+
+                    a ^= prevSeed1;
                     b ^= seed2 ^ 0x9E3779B97F4A7C15ULL;
 
                     UINT64 L, H;
@@ -234,7 +236,7 @@ struct KDefaultHash
                     L = a * b; 
                     H = __umulh(a, b);
                 #endif
-                    seed1 = L ^ H ^ a ^ _rotl64(b, 31);
+                    seed1 = L ^ H ^ _rotl64(prevSeed1, 17) ^ a ^ _rotl64(b, 31);
                 }
 
                 // Branchless Overlapping Tail: Hash the absolute LAST 16 bytes of the struct.
@@ -244,7 +246,9 @@ struct KDefaultHash
                     RtlCopyMemory(&a, p + sizeof(T) - 16, 8);
                     RtlCopyMemory(&b, p + sizeof(T) - 8, 8);
 
-                    a ^= seed1;
+                    const UINT64 prevSeed1 = seed1;
+
+                    a ^= prevSeed1;
                     b ^= seed2 ^ 0x94D049BB133111EBULL;
 
                     UINT64 L, H;
@@ -254,7 +258,7 @@ struct KDefaultHash
                     L = a * b; 
                     H = __umulh(a, b);
                 #endif
-                    seed1 = L ^ H ^ a ^ _rotl64(b, 31);
+                    seed1 = L ^ H ^ _rotl64(prevSeed1, 17) ^ a ^ _rotl64(b, 31);
                 }
 
                 return static_cast<SIZE_T>(Mix64(seed1 ^ _rotl64(seed2, 31)));
@@ -354,16 +358,45 @@ template <typename K, typename V, typename Hash = KDefaultHash<K>, ULONG64 PoolF
 class KFlatHashMap
 {
 private:
+    static_assert(PoolTag != 0, "ExAllocatePool2 requires a non-zero PoolTag.");
+
     // Sentinel value representing an empty, unpopulated slot in the control array.
     static constexpr UCHAR  kEmptyCtrl = 0xFF;
     
     // The number of elements fetched and processed simultaneously during SWAR probing.
     static constexpr SIZE_T kGroupSize = 8;
 
+    template <bool Cond, typename TTrue, typename TFalse>
+    struct Conditional
+    {
+        using Type = TTrue;
+    };
+
+    template <typename TTrue, typename TFalse>
+    struct Conditional<false, TTrue, TFalse>
+    {
+        using Type = TFalse;
+    };
+
+    // Internal disambiguation tag preventing Slot's forwarding constructor from
+    // shadowing the implicitly-declared copy constructor.
+    struct SlotConstructTag {};
+
+    // Qualifies Key as const for trivially copyable keys to prevent accidental mutation
+    // through mutable iterators while preserving zero-copy move semantics during Rehash()
+    // for non-trivially copyable key types.
+    using StoredKey = typename Conditional<kstd::is_trivially_copyable_v<K>, const K, K>::Type;
+
     struct Slot
     {        
-        K Key;   // The unique key used to index the hash map.                
-        V Value; // The data value mapped to the unique key.
+        StoredKey Key;   // The unique key used to index the hash map.                
+        V         Value; // The data value mapped to the unique key.
+
+        template <typename KArg, typename... VArgs>
+        __forceinline Slot(SlotConstructTag, KArg&& InKey, VArgs&&... InArgs) noexcept : Key(kstd::forward<KArg>(InKey)),
+                                                                                         Value(kstd::forward<VArgs>(InArgs)...)
+        {
+        }
     };
 
     //--------------------------------------------------------------------------------
@@ -593,6 +626,11 @@ public:
     //   resources and is strictly responsible for freeing them to prevent kernel 
     //   memory leaks.
     //
+    // IMPORTANT ALIASING / INVALIDATION NOTE:
+    //   Insertion may trigger Rehash(), which moves existing slots and frees the
+    //   previous pool buffer before constructing the new element. Neither 'Key' nor
+    //   any argument in 'args...' may reference a key or value stored inside this map.
+    //
     // Parameters:
     //   Key      - The map key indexing the element.
     //   OutValue - Double-pointer receiving the constructed or existing value's 
@@ -606,7 +644,7 @@ public:
     template <typename... Args>
     NTSTATUS Emplace(_In_                           const K& Key,
                      _Outptr_result_nullonfailure_  V**      OutValue,
-                     _In_                           Args&&... args) noexcept
+                     Args&&...                               args) noexcept
     {
         *OutValue = nullptr;
 
@@ -697,8 +735,7 @@ public:
                 
                 m_Ctrl[index + offset] = static_cast<UCHAR>(h2);
                 
-                new (&pSlot->Key)   K(Key);
-                new (&pSlot->Value) V(kstd::forward<Args>(args)...);
+                ::new (static_cast<void*>(pSlot)) Slot(SlotConstructTag{}, Key, kstd::forward<Args>(args)...);
                 m_Size++;
                 
                 *OutValue = &pSlot->Value;
@@ -715,12 +752,12 @@ public:
     }
 
     //--------------------------------------------------------------------------------
-    // Fetches an existing value or inserts a newly constructed one.
+    // Fetches an existing value or inserts a newly default-constructed one.
     //
     // IMPORTANT RESOURCE LIFECYCLE NOTE:
-    //   Returns STATUS_OBJECT_NAME_EXISTS if the key is already present. Callers 
-    //   forwarding r-values must check for this specific status code and manually 
-    //   cleanup their unconsumed resources.
+    //   Returns STATUS_OBJECT_NAME_EXISTS if the key is already present, leaving
+    //   the existing value untouched. Insertion may trigger Rehash(); 'Key' must
+    //   not reference an element stored inside this map.
     //
     // Parameters:
     //   Key      - The mapped entry identifier to lookup or create.
@@ -839,10 +876,11 @@ public:
 
         //--------------------------------------------------------------------------------
         // Conversion constructor allowing implicit promotion from Iterator to ConstIterator.
-        // Const-correctness is inherently enforced: attempting to construct a non-const 
-        // Iterator from a ConstIterator will fail to compile as UCHAR* cannot bind to const UCHAR*.
+        // Constrained via requires-clause so type traits and SFINAE accurately report
+        // ConstIterator -> Iterator conversion as disallowed.
         //--------------------------------------------------------------------------------
         template <bool OtherConst>
+            requires (IsConst && !OtherConst)
         BaseIterator(const BaseIterator<OtherConst>& Other) noexcept : m_Ctrl(Other.m_Ctrl), 
                                                                        m_Slots(Other.m_Slots), 
                                                                        m_Capacity(Other.m_Capacity), 
@@ -912,6 +950,7 @@ public:
         
         //--------------------------------------------------------------------------------
         // Dereferences the iterator to provide a direct reference to the Key/Value slot.
+        // Callers must never mutate Key in place, as doing so invalidates bucket placement.
         //
         // Return:
         //   Underlying reference (mutable or const depending on instantiation).
@@ -923,6 +962,7 @@ public:
 
         //--------------------------------------------------------------------------------
         // Accesses the Key or Value properties of the currently pointed-to slot.
+        // Callers must never mutate Key in place, as doing so invalidates bucket placement.
         //
         // Return:
         //   Underlying address (mutable or const depending on instantiation).
@@ -934,15 +974,28 @@ public:
 
     private:
         //--------------------------------------------------------------------------------
-        // Linearly scans the control array until a valid (non-empty) control byte is 
-        // found, or the end of capacity is reached. Append-only logic relies safely 
-        // on checking strictly for kEmptyCtrl.
+        // Scans the control array 8 bytes at a time via 64-bit SWAR bitmasks until a
+        // valid (non-empty) control byte is found, or the end of capacity is reached.
+        // Valid 7-bit H2 metadata bytes have MSB = 0 while kEmptyCtrl (0xFF) has MSB = 1.
         //--------------------------------------------------------------------------------
         void AdvanceToOccupied() noexcept
         {
-            while (m_Index < m_Capacity && m_Ctrl[m_Index] == kEmptyCtrl) 
-            { 
-                m_Index++; 
+            while (m_Index < m_Capacity)
+            {
+                const SIZE_T groupStart = m_Index & ~(kGroupSize - 1);
+                const SIZE_T laneOffset = m_Index & (kGroupSize - 1);
+                const UINT64 ctrlBlock  = LoadCtrlGroup(&m_Ctrl[groupStart]);
+                const UINT64 occupied   = (~ctrlBlock & 0x8080808080808080ULL) >> (laneOffset * 8);
+
+                if (occupied != 0)
+                {
+                    unsigned long bitPos;
+                    _BitScanForward64(&bitPos, occupied);
+                    m_Index += (bitPos >> 3);
+                    return;
+                }
+
+                m_Index = groupStart + kGroupSize;
             }
         }
         
@@ -1003,9 +1056,9 @@ public:
 private:
 
     //--------------------------------------------------------------------------------
-    // Invokes destructors on all active Key/Value pairs using 64-bit SWAR group
-    // scanning to jump directly across occupied slots. Completely elided by the
-    // compiler when K and V are trivially destructible.
+    // Invokes destructors on all active Key/Value pairs in reverse construction order
+    // using 64-bit SWAR group scanning to jump directly across occupied slots.
+    // Completely elided by the compiler when K and V are trivially destructible.
     //--------------------------------------------------------------------------------
     void DestroyElements() noexcept
     {
@@ -1024,8 +1077,7 @@ private:
                         _BitScanForward64(&bitPos, occupied);
 
                         const SIZE_T i = groupIdx + (bitPos >> 3);
-                        m_Slots[i].Key.~K();
-                        m_Slots[i].Value.~V();
+                        m_Slots[i].~Slot();
 
                         occupied &= occupied - 1;
                     }
@@ -1114,8 +1166,9 @@ private:
     //--------------------------------------------------------------------------------
     NTSTATUS Rehash(_In_ SIZE_T NewCapacity) noexcept
     {        
-        SIZE_T ctrlBytes          = NewCapacity;
-        SIZE_T slotBytes          = 0;
+        SIZE_T ctrlBytes = NewCapacity;
+        SIZE_T slotBytes = 0;
+
         // Align slots to 128 bytes so each 8-slot group sits in an aligned 128-byte
         // L2 spatial prefetcher pair on x64 and ARM64 processors.
         constexpr SIZE_T slotAlign  = (alignof(Slot) > 128) ? alignof(Slot) : 128;
@@ -1129,7 +1182,22 @@ private:
             return STATUS_INTEGER_OVERFLOW;
         }
 
-        if (!NT_SUCCESS(RtlSizeTAdd(ctrlBytes, maxPadding, &totalAllocSize)) ||
+        // ExAllocatePool2 guarantees PAGE_SIZE alignment for allocations >= PAGE_SIZE.
+        // Omit alignment padding when the unpadded allocation is already >= PAGE_SIZE
+        // and ctrlBytes is a multiple of slotAlign, preventing an extra 4 KB page waste.
+        SIZE_T padBytes = maxPadding;
+        if constexpr (slotAlign <= PAGE_SIZE)
+        {
+            SIZE_T unpaddedSize = 0;
+            if (NT_SUCCESS(RtlSizeTAdd(ctrlBytes, slotBytes, &unpaddedSize)) &&
+                unpaddedSize >= PAGE_SIZE &&
+                (ctrlBytes & maxPadding) == 0)
+            {
+                padBytes = 0;
+            }
+        }
+
+        if (!NT_SUCCESS(RtlSizeTAdd(ctrlBytes, padBytes, &totalAllocSize)) ||
             !NT_SUCCESS(RtlSizeTAdd(totalAllocSize, slotBytes, &totalAllocSize))) [[unlikely]]
         {
             return STATUS_INTEGER_OVERFLOW;
@@ -1185,11 +1253,11 @@ private:
                                 const SIZE_T realIdx = index + (bitPos >> 3);
                                 pNewCtrl[realIdx] = h2;
                                 
-                                new (&pNewSlots[realIdx].Key)   K(kstd::move(m_Slots[i].Key));
-                                new (&pNewSlots[realIdx].Value) V(kstd::move(m_Slots[i].Value));
+                                ::new (static_cast<void*>(&pNewSlots[realIdx])) Slot(SlotConstructTag{},
+                                                                                     kstd::move(m_Slots[i].Key),
+                                                                                     kstd::move(m_Slots[i].Value));
                                 
-                                m_Slots[i].Key.~K();
-                                m_Slots[i].Value.~V();
+                                m_Slots[i].~Slot();
                                 break;
                             }
                             
